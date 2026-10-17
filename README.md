@@ -2,6 +2,8 @@
 
 **FunGuys** is a real-time, multi-agent engineering platform that pools your and your friends' existing AI subscriptions (**Claude Code Pro/Max**, **Google Gemini CLI**, **OpenAI Codex CLI**, plus local/fallback API models) into a unified, self-testing software development swarm.
 
+> 📖 **Looking for the complete walkthrough? Check out the [Startup & Deployment Guide](STARTUP_GUIDE.md).**
+
 ---
 
 ## ✨ Key Architecture Highlights
