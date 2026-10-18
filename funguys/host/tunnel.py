@@ -1,4 +1,4 @@
-"""LAN IP detection and optional Cloudflare/ngrok tunnel launcher for Host PC."""
+"""LAN IP detection and automatic Cloudflare/ngrok tunnel launcher for Host PC."""
 
 from __future__ import annotations
 
@@ -6,14 +6,19 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
+from pathlib import Path
 from typing import Optional, Tuple
+
+_ACTIVE_TUNNEL_URL: Optional[str] = None
+_TUNNEL_PROC: Optional[subprocess.Popen] = None
 
 
 def get_lan_ip() -> str:
     """Return the Host PC's IP address, prioritizing Tailscale / ZeroTier mesh overlay IPs if active."""
-    # Check for Tailscale (100.64.0.0/10) or ZeroTier virtual adapter IPs
     try:
         import psutil
+
         addrs = psutil.net_if_addrs()
         for iface_name, snics in addrs.items():
             iface_lower = iface_name.lower()
@@ -21,7 +26,6 @@ def get_lan_ip() -> str:
                 for snic in snics:
                     if snic.family == socket.AF_INET and not snic.address.startswith("127."):
                         return snic.address
-        # Also check all IP addresses for standard Tailscale CGNAT range (100.64.0.0 - 100.127.255.255)
         for snics in addrs.values():
             for snic in snics:
                 if snic.family == socket.AF_INET and snic.address.startswith("100."):
@@ -40,63 +44,55 @@ def get_lan_ip() -> str:
 
 
 def get_public_tunnel_url() -> Optional[str]:
-    """Check if a Cloudflare Quick Tunnel or Ngrok tunnel is currently active locally."""
-    # 1. Cloudflare Quick Tunnel local metrics port (20241)
-    try:
-        import urllib.request
-        import json
-
-        req = urllib.request.Request("http://127.0.0.1:20241/quicktunnel", headers={"User-Agent": "funguys"})
-        with urllib.request.urlopen(req, timeout=0.8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            hostname = data.get("hostname")
-            if hostname:
-                return f"https://{hostname}"
-    except Exception:
-        pass
-
-    # 2. Ngrok local API (4040)
-    try:
-        import urllib.request
-        import json
-
-        req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels", headers={"User-Agent": "funguys"})
-        with urllib.request.urlopen(req, timeout=0.8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            for tun in data.get("tunnels", []):
-                if tun.get("public_url"):
-                    return str(tun["public_url"])
-    except Exception:
-        pass
-
+    """Return only a URL owned by a still-running tunnel process."""
+    global _ACTIVE_TUNNEL_URL, _TUNNEL_PROC
+    if _TUNNEL_PROC is not None and _TUNNEL_PROC.poll() is None:
+        return _ACTIVE_TUNNEL_URL
+    _ACTIVE_TUNNEL_URL = None
+    _TUNNEL_PROC = None
     return None
 
 
-def start_cloudflare_tunnel(port: int) -> Tuple[Optional[subprocess.Popen], Optional[str]]:
-    """Start a free Cloudflare TryCloudflare tunnel if `cloudflared` is installed."""
-    existing_url = get_public_tunnel_url()
-    if existing_url:
-        return None, existing_url
+def stop_cloudflare_tunnel():
+    global _ACTIVE_TUNNEL_URL, _TUNNEL_PROC
+    proc = _TUNNEL_PROC
+    _ACTIVE_TUNNEL_URL = None
+    _TUNNEL_PROC = None
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
-    cf_bin = shutil.which("cloudflared")
-    if not cf_bin:
+
+def start_cloudflare_tunnel(port: int, timeout_sec: float = 15) -> Tuple[Optional[subprocess.Popen], Optional[str]]:
+    """CLI-owned startup, bounded by a deadline; persisted URLs are never trusted."""
+    global _ACTIVE_TUNNEL_URL, _TUNNEL_PROC
+    if get_public_tunnel_url():
+        return _TUNNEL_PROC, _ACTIVE_TUNNEL_URL
+    binary = shutil.which('cloudflared')
+    if not binary:
         return None, None
     try:
-        proc = subprocess.Popen(
-            [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{port}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        if proc.stdout:
-            for _ in range(40):
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                match = re.search(r"(https://[a-zA-Z0-9\-]+\.trycloudflare\.com)", line)
-                if match:
-                    return proc, match.group(1)
-        return proc, None
-    except Exception:
-        return None, None
-
+        proc = subprocess.Popen([binary,'tunnel','--url',f'http://127.0.0.1:{port}'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+    except OSError:
+        return None,None
+    _TUNNEL_PROC = proc
+    ready = threading.Event()
+    def drain():
+        global _ACTIVE_TUNNEL_URL
+        try:
+            for line in proc.stdout:
+                match = re.search(r'(https://[a-zA-Z0-9-]+\.trycloudflare\.com)',line)
+                if match and _TUNNEL_PROC is proc:
+                    _ACTIVE_TUNNEL_URL = match.group(1)
+                    ready.set()
+        finally:
+            ready.set()
+    threading.Thread(target=drain,daemon=True).start()
+    if not ready.wait(timeout_sec) or proc.poll() is not None or not _ACTIVE_TUNNEL_URL:
+        stop_cloudflare_tunnel()
+        return None,None
+    return proc,_ACTIVE_TUNNEL_URL

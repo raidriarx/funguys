@@ -12,8 +12,9 @@ import re
 import shutil
 import subprocess
 import uuid
+import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple,Iterator
 
 import networkx as nx
 
@@ -40,32 +41,42 @@ class GraphifyEngine:
 
     def __init__(self, workspace_path: Path) -> None:
         self.workspace_path = workspace_path
-        self.graph_dir = workspace_path / ".graphify"
-        self.graph_dir.mkdir(parents=True, exist_ok=True)
+        from funguys.files import runtime_directory
+        self.graph_dir = runtime_directory(workspace_path,'.graphify')
         self.G: nx.DiGraph = nx.DiGraph()
         self.last_signatures: Dict[str, Dict[str, str]] = {}
+        baseline = self.graph_dir / 'signatures.json'
+        if baseline.exists():
+            try:
+                self.last_signatures = json.loads(baseline.read_text(encoding='utf-8'))
+            except (ValueError, OSError):
+                pass
+        self.last_graph_data = {}
+        self._baseline_loaded = baseline.exists()
 
     def build_graph(self) -> Dict[str, Any]:
         """Run deterministic Pass-1 AST analysis across the workspace (0 LLM tokens)."""
-        # Also trigger external `graphify` CLI if user installed `graphifyy` globally
-        if shutil.which("graphify"):
-            try:
-                subprocess.run(
-                    ["graphify", "--help"],
-                    cwd=str(self.workspace_path),
-                    capture_output=True,
-                    timeout=3,
-                )
-            except Exception:
-                pass
-
+        self.last_error = None
         G = nx.DiGraph()
         current_signatures: Dict[str, Dict[str, str]] = {}
+        warnings = []
+        total_bytes = 0
 
         if not self.workspace_path.exists():
             self.workspace_path.mkdir(parents=True, exist_ok=True)
 
-        for file_path in self._iter_source_files():
+        for index,file_path in enumerate(self._iter_source_files()):
+            from funguys.files import MAX_FILE,MAX_BUNDLE,MAX_FILES
+            if index>=MAX_FILES:
+                warnings.append('Graph truncated at the workspace file limit')
+                break
+            if file_path.stat().st_size>MAX_FILE:
+                warnings.append('Oversized source file skipped: '+file_path.relative_to(self.workspace_path).as_posix())
+                continue
+            total_bytes += file_path.stat().st_size
+            if total_bytes>MAX_BUNDLE:
+                warnings.append('Graph truncated at the workspace byte limit')
+                break
             rel_path = file_path.relative_to(self.workspace_path).as_posix()
             file_node = f"file:{rel_path}"
             G.add_node(
@@ -89,6 +100,12 @@ class GraphifyEngine:
 
         self.G = G
         graph_data = self._export_graph_artifacts(G, current_signatures)
+        graph_data['warnings'] = warnings
+        self.last_graph_data = graph_data
+        if not self._baseline_loaded:
+            self.last_signatures = {k:dict(v) for k,v in current_signatures.items()}
+            (self.graph_dir/'signatures.json').write_text(json.dumps(self.last_signatures),encoding='utf-8')
+            self._baseline_loaded = True
         return graph_data
 
     def scan_and_detect_contract_deltas(
@@ -149,8 +166,18 @@ class GraphifyEngine:
                             ),
                         )
                     )
+            elif old_info and not new_info:
+                dep_tasks = self._find_dependent_tasks(old_info['file'], old_info['symbol'], task_id, all_tasks)
+                alerts.append(ContractAlert(id='alert-' + uuid.uuid4().hex, task_id=task_id, agent_id=agent_id,
+                    symbol_name=old_info['symbol'], file_path=old_info['file'], change_type='removed_export',
+                    old_signature=old_info['signature'], dependent_task_ids=dep_tasks,
+                    summary=f"[Removed Contract] {old_info['file']} :: {old_info['signature']} -> Notify tasks: {', '.join(dep_tasks)}"))
 
         self.last_signatures = {k: dict(v) for k, v in new_sigs.items()}
+        baseline = self.graph_dir / 'signatures.json'
+        temporary = baseline.with_suffix('.tmp')
+        temporary.write_text(json.dumps(self.last_signatures), encoding='utf-8')
+        temporary.replace(baseline)
         return graph_data, alerts
 
     def query(self, question: str) -> str:
@@ -213,6 +240,8 @@ class GraphifyEngine:
 
     def get_subgraph_digest(self, target_files: List[str]) -> str:
         """Generate a compact ~150-token structural digest for Baton Pass handoffs."""
+        if getattr(self,'last_error',None):
+            return 'Graph unavailable; inspect current source directly. '+self.last_error
         if self.G.number_of_nodes() == 0:
             self.build_graph()
         lines = ["### Graphify Structural Context (Zero-Token AST Map)"]
@@ -259,15 +288,9 @@ class GraphifyEngine:
                 dependents.append(t.id)
         return sorted(set(dependents))
 
-    def _iter_source_files(self) -> List[Path]:
-        results: List[Path] = []
-        for path in self.workspace_path.rglob("*"):
-            rel_parts = path.relative_to(self.workspace_path).parts
-            if any(part in IGNORED_DIRS for part in rel_parts):
-                continue
-            if path.is_file() and path.suffix in CODE_EXTENSIONS:
-                results.append(path)
-        return sorted(results)
+    def _iter_source_files(self) -> Iterator[Path]:
+        from funguys.files import source_files
+        return (p for p in source_files(self.workspace_path) if p.suffix in CODE_EXTENSIONS)
 
     def _parse_python_ast(
         self,
@@ -284,7 +307,7 @@ class GraphifyEngine:
 
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                args = [a.arg for a in node.args.args]
+                args = ast.unparse(node.args)
                 ret = ""
                 if node.returns:
                     try:
@@ -292,7 +315,7 @@ class GraphifyEngine:
                     except Exception:
                         ret = ""
                 prefix = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
-                sig = f"{prefix}{node.name}({', '.join(args)}){ret}"
+                sig = f"{prefix}{node.name}({args}){ret}"
                 sym_node = f"sym:{rel_path}:{node.name}"
                 G.add_node(
                     sym_node,
@@ -311,12 +334,24 @@ class GraphifyEngine:
                         G.add_edge(sym_node, f"call:{sub.func.id}", relation="calls")
 
             elif isinstance(node, ast.ClassDef):
+                for method in node.body:
+                    if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        name = f'{node.name}.{method.name}'
+                        key = f'sym:{rel_path}:{name}'
+                        signature = f"{'async ' if isinstance(method, ast.AsyncFunctionDef) else ''}def {name}({ast.unparse(method.args)})"
+                        if method.returns:
+                            signature += ' -> ' + ast.unparse(method.returns)
+                        signatures[key] = {'file': rel_path, 'symbol': name, 'signature': signature}
+                        G.add_node(key, id=key, label=name, type='method', file=rel_path, signature=signature)
+                        G.add_edge(file_node, key, relation='defines')
                 methods = [
                     n.name
                     for n in node.body
                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                 ]
-                sig = f"class {node.name}[{', '.join(methods[:6])}]"
+                fields = [ast.unparse(n) for n in node.body if isinstance(n,ast.AnnAssign)]
+                bases = ', '.join(ast.unparse(n) for n in node.bases)
+                sig = f"class {node.name}({bases})[{'; '.join(fields)}; {', '.join(methods)}]"
                 sym_node = f"sym:{rel_path}:{node.name}"
                 G.add_node(
                     sym_node,
@@ -346,12 +381,16 @@ class GraphifyEngine:
             (r"export\s+(?:async\s+)?function\s+([A-Za-z0-9_]+)\s*(\([^)]*\))", "function"),
             (r"export\s+interface\s+([A-Za-z0-9_]+)", "interface"),
             (r"export\s+const\s+([A-Za-z0-9_]+)\s*=", "const"),
+            (r"export\s+type\s+([A-Za-z0-9_]+)\s*=", "type"),
         ]
         for regex, sym_type in patterns:
             for match in re.finditer(regex, content):
                 name = match.group(1)
                 params = match.group(2) if match.lastindex and match.lastindex >= 2 else ""
                 sig = f"{sym_type} {name}{params}"
+                # Conservative change fingerprint covers interface members, return types,
+                # aliases and implementation changes without pretending regex is a TS parser.
+                sig += ' [module:' + hashlib.sha256(content.encode()).hexdigest()[:16] + ']'
                 sym_node = f"sym:{rel_path}:{name}"
                 G.add_node(
                     sym_node,
@@ -363,6 +402,12 @@ class GraphifyEngine:
                 )
                 G.add_edge(file_node, sym_node, relation="defines")
                 signatures[sym_node] = {"file": rel_path, "symbol": name, "signature": sig}
+        if re.search(r'\bexport\b|module\.exports',content):
+            key = f'sym:{rel_path}:module_exports'
+            sig = 'module exports [' + hashlib.sha256(content.encode()).hexdigest()[:16] + ']'
+            G.add_node(key,id=key,label='module_exports',type='module',file=rel_path,signature=sig)
+            G.add_edge(file_node,key,relation='defines')
+            signatures[key] = {'file':rel_path,'symbol':'module_exports','signature':sig}
 
     def _export_graph_artifacts(
         self,

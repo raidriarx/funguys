@@ -1,0 +1,14 @@
+.git
+.funguys
+.venv
+.env
+.env.*
+node_modules
+__pycache__
+.aws
+.ssh
+.codex
+.agents
+*.pem
+*.key
+*.db

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -25,10 +26,15 @@ class StateStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+    @contextmanager
+    def _connect(self):
+        conn = sqlite3.connect(str(self.db_path), timeout=15, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -60,6 +66,16 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS events (
                     id TEXT PRIMARY KEY,
                     timestamp TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS credentials (
+                    token_hash TEXT PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    agent_id TEXT,
+                    expires_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS chat (
+                    id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL
                 );
                 """
@@ -176,3 +192,38 @@ class StateStore:
             "qa_reports": self.list_qa_reports(limit=30),
             "events": self.list_events(limit=60),
         }
+
+    def replace_tasks(self, tasks, project=None):
+        with self._connect() as conn:
+            conn.execute('DELETE FROM tasks')
+            for task in tasks:
+                conn.execute('INSERT INTO tasks VALUES (?, ?)', (task.id, task.model_dump_json()))
+            if project:
+                conn.execute('DELETE FROM project')
+                conn.execute('INSERT INTO project VALUES (?, ?)', (project.id, project.model_dump_json()))
+
+    def delete_agent(self, agent_id):
+        with self._connect() as conn:
+            conn.execute('DELETE FROM agents WHERE id = ?', (agent_id,))
+            conn.execute('DELETE FROM credentials WHERE agent_id = ?', (agent_id,))
+
+    def save_credential(self, token_hash, role, agent_id=None, expires_at=None):
+        with self._connect() as conn:
+            conn.execute('INSERT OR REPLACE INTO credentials VALUES (?, ?, ?, ?)', (token_hash, role, agent_id, expires_at))
+
+    def get_credential(self, token_hash):
+        with self._connect() as conn:
+            row = conn.execute('SELECT * FROM credentials WHERE token_hash = ?', (token_hash,)).fetchone()
+            return dict(row) if row else None
+
+    def save_chat(self, entry):
+        with self._connect() as conn:
+            conn.execute('INSERT OR REPLACE INTO chat VALUES (?, ?)', (entry['id'], json.dumps(entry)))
+
+    def list_chat(self):
+        with self._connect() as conn:
+            return [json.loads(row['payload']) for row in conn.execute('SELECT payload FROM chat ORDER BY rowid DESC LIMIT 100').fetchall()][::-1]
+
+    def clear_chat(self):
+        with self._connect() as conn:
+            conn.execute('DELETE FROM chat')

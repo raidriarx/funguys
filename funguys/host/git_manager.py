@@ -1,132 +1,143 @@
-"""Git Repository, Worktree Isolation, and Baton-Pass Branch Manager for Host PC."""
-
+"""Checked Git operations and isolated assignment worktrees."""
 from __future__ import annotations
-
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
+from funguys.files import bundle, confined_path, source_files, validate_relative_path,runtime_directory,check_path_collisions
 
 class GitWorkspaceManager:
-    """Manages the canonical Git repository and isolated task branches on the Host PC."""
-
-    def __init__(self, workspace_path: Path) -> None:
-        self.workspace_path = workspace_path
+    def __init__(self, workspace_path: Path):
+        self.workspace_path = workspace_path.resolve()
         self.workspace_path.mkdir(parents=True, exist_ok=True)
-        self.worktrees_dir = self.workspace_path / ".funguys" / "worktrees"
-        self.worktrees_dir.mkdir(parents=True, exist_ok=True)
+        self.worktrees_dir = runtime_directory(self.workspace_path,'.funguys','w')
 
-    def _run_git(self, args: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
-        target_cwd = cwd or self.workspace_path
-        proc = subprocess.run(
-            ["git", *args],
-            cwd=str(target_cwd),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+    def _run_git(self, args, cwd=None):
+        proc = subprocess.run(['git', '-c', 'core.hooksPath=', '-c', 'core.longpaths=true', '-c', 'core.autocrlf=false', *args], cwd=str(cwd or self.workspace_path), capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60)
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
-    def ensure_initialized(self, github_url: Optional[str] = None) -> None:
-        """Initialize a Git repo if not already present, or link remote GitHub repo."""
-        git_dir = self.workspace_path / ".git"
-        if not git_dir.exists():
-            self._run_git(["init", "-b", "main"])
-            self._run_git(["config", "user.name", "FunGuys Orchestrator"])
-            self._run_git(["config", "user.email", "orchestrator@funguys.local"])
-            gitignore = self.workspace_path / ".gitignore"
-            if not gitignore.exists():
-                gitignore.write_text(
-                    ".funguys/\n__pycache__/\nnode_modules/\n.venv/\n*.pyc\n",
-                    encoding="utf-8",
-                )
-            readme = self.workspace_path / "README.md"
-            if not readme.exists():
-                readme.write_text("# FunGuys Project Workspace\n", encoding="utf-8")
-            self._run_git(["add", "."])
-            self._run_git(["commit", "-m", "chore: initialize FunGuys workspace"])
+    def git(self, *args, cwd=None):
+        code, out, err = self._run_git(list(args), cwd)
+        if code:
+            raise RuntimeError(f'Git {args[0]} failed: {err or out}')
+        return out
 
-        if github_url:
-            code, out, _ = self._run_git(["remote"])
-            if "origin" not in out.splitlines():
-                self._run_git(["remote", "add", "origin", github_url])
+    def ensure_initialized(self, github_url=None):
+        if not (self.workspace_path / '.git').exists():
+            self.git('init', '-b', 'main')
+            self.git('config', 'user.name', 'FunGuys Orchestrator')
+            self.git('config', 'user.email', 'orchestrator@funguys.local')
+            ignore = self.workspace_path / '.gitignore'
+            if not ignore.exists():
+                ignore.write_text('.funguys/\n.graphify/\n.venv/\nnode_modules/\n__pycache__/\n.env\n.env.*\n', encoding='utf-8')
+            names = [p.relative_to(self.workspace_path).as_posix() for p in source_files(self.workspace_path)]
+            for i in range(0, len(names), 50):
+                self.git('add', '--', *names[i:i+50])
+            self.git('commit', '--allow-empty', '-m', 'chore: initialize FunGuys workspace')
+        if github_url and 'origin' not in self.git('remote').splitlines():
+            self.git('remote', 'add', 'origin', github_url)
+        self.git('rev-parse', '--verify', 'HEAD')
+        self.git('symbolic-ref', '--quiet', 'HEAD')
 
-    def prepare_task_branch(self, task_id: str, is_wip_handoff: bool = False) -> str:
-        """Ensure a dedicated branch exists for the given task."""
-        self.ensure_initialized()
-        branch_name = f"wip/{task_id}" if is_wip_handoff else f"task/{task_id}"
-        self._run_git(["branch", branch_name, "main"])
-        return branch_name
+    def head(self):
+        return self.git('rev-parse', 'HEAD')
 
-    def apply_worker_changes(
-        self,
-        task_id: str,
-        agent_id: str,
-        files: Dict[str, str],
-        commit_message: str,
-        is_wip: bool = False,
-    ) -> Tuple[bool, str]:
-        """Write changed files from a worker node and commit them on the Host repo."""
-        self.ensure_initialized()
-        branch_name = f"wip/{task_id}" if is_wip else f"task/{task_id}"
+    def require_clean(self):
+        if self.git('status', '--porcelain', '--untracked-files=no'):
+            raise ValueError('Commit or stash tracked workspace changes before approving or merging work')
 
-        # Write files into workspace and commit on branch
-        for rel_path, content in files.items():
-            safe_rel = Path(rel_path)
-            if safe_rel.is_absolute() or ".." in safe_rel.parts:
+    def commit_contracts(self, content):
+        changed = self.git('diff', '--name-only').splitlines() + self.git('diff', '--cached', '--name-only').splitlines()
+        if any(p != 'CONTRACTS.md' for p in changed):
+            raise ValueError('Commit or stash workspace edits before approving a plan')
+        confined_path(self.workspace_path, 'CONTRACTS.md').write_text(content, encoding='utf-8')
+        self.git('add', '--', 'CONTRACTS.md')
+        if self.git('diff', '--cached', '--name-only'):
+            self.git('-c','user.name=FunGuys Orchestrator','-c','user.email=orchestrator@funguys.local','commit', '-m', 'docs: approve versioned project contracts')
+
+    def prepare_candidate(self, assignment_id, base_revision=None):
+        candidate = self.worktrees_dir / assignment_id[:16]
+        if not candidate.resolve().is_relative_to(self.worktrees_dir.resolve()):
+            raise ValueError('Invalid assignment directory')
+        self.git('worktree', 'add', '--detach', str(candidate), base_revision or self.head())
+        return candidate
+
+    def remove_candidate(self,candidate):
+        candidate = Path(candidate)
+        if candidate.is_symlink() or (hasattr(candidate,'is_junction') and candidate.is_junction()):
+            raise ValueError('Managed worktrees cannot be links')
+        candidate = candidate.resolve()
+        if candidate.parent != self.worktrees_dir.resolve():
+            raise ValueError('Only managed assignment worktrees can be removed')
+        self.git('worktree','remove','--force',str(candidate))
+
+    def write_changes(self, candidate, files, deleted_files=()):
+        check_path_collisions([*files,*deleted_files])
+        destinations = {name: confined_path(candidate, name) for name in files}
+        deleted = {name: confined_path(candidate, name) for name in deleted_files}
+        if set(destinations) & set(deleted):
+            raise ValueError('A file cannot be both updated and deleted')
+        for dest in [*destinations.values(), *deleted.values()]:
+            if dest.exists() and not dest.is_file():
+                raise ValueError('Only regular file changes are accepted')
+        for name, dest in destinations.items():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(files[name])
+        for dest in deleted.values():
+            dest.unlink(missing_ok=True)
+
+    def commit_candidate(self, candidate, task_id, agent_id, message):
+        names = [p.relative_to(candidate).as_posix() for p in source_files(candidate)]
+        for name in self.git('ls-files', '-z', cwd=candidate).split('\x00'):
+            if not name:
                 continue
-            full_path = self.workspace_path / safe_rel
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_text(content, encoding="utf-8")
-
-        self._run_git(["add", "."])
-        code, out, err = self._run_git(
-            ["commit", "--allow-empty", "-m", f"[{task_id}] ({agent_id}) {commit_message}"]
-        )
-        # Also update the task/wip branch ref to current HEAD
-        self._run_git(["branch", "-f", branch_name, "HEAD"])
-        return code == 0, out or err
-
-    def create_handoff_document(
-        self,
-        task_id: str,
-        from_agent_id: str,
-        handoff_notes: str,
-        subgraph_digest: str,
-    ) -> str:
-        """Write a compact Baton-Pass HANDOFF.md for the next teammate's AI."""
-        handoff_dir = self.workspace_path / ".funguys" / "handoffs"
-        handoff_dir.mkdir(parents=True, exist_ok=True)
-        handoff_file = handoff_dir / f"HANDOFF_{task_id}.md"
-
-        content = (
-            f"# Baton Pass Handoff — `{task_id}`\n"
-            f"- **Previous AI Node:** `{from_agent_id}`\n"
-            f"- **WIP Branch:** `wip/{task_id}`\n\n"
-            f"## Progress & Immediate Next Step\n"
-            f"{handoff_notes}\n\n"
-            f"{subgraph_digest}\n"
-        )
-        handoff_file.write_text(content, encoding="utf-8")
-        return content
-
-    def get_workspace_files_bundle(self, target_files: Optional[List[str]] = None) -> Dict[str, str]:
-        """Return a dictionary of relative file paths to file contents for worker sync."""
-        bundle: Dict[str, str] = {}
-        for path in self.workspace_path.rglob("*"):
-            rel_parts = path.relative_to(self.workspace_path).parts
-            if any(
-                part in {".git", ".funguys", "node_modules", "__pycache__", ".venv"}
-                for part in rel_parts
-            ):
+            try:
+                validate_relative_path(name)
+            except ValueError:
                 continue
-            if path.is_file():
-                rel = path.relative_to(self.workspace_path).as_posix()
-                if target_files and not any(tf in rel or rel in tf for tf in target_files) and not rel.startswith(".graphify/"):
-                    continue
-                try:
-                    bundle[rel] = path.read_text(encoding="utf-8")
-                except Exception:
-                    continue
-        return bundle
+            if not (candidate / name).exists():
+                names.append(name)
+        names = sorted(set(names))
+        for i in range(0, len(names), 50):
+            self.git('add', '-A', '--', *names[i:i+50], cwd=candidate)
+        if not self.git('diff', '--cached', '--name-only', cwd=candidate):
+            raise ValueError('Submission contains no changes relative to its assignment')
+        self.git('-c', 'user.name=FunGuys Orchestrator', '-c', 'user.email=orchestrator@funguys.local', 'commit', '-m', f'[{task_id}] ({agent_id}) {message[:500]}', cwd=candidate)
+        revision = self.git('rev-parse', 'HEAD', cwd=candidate)
+        self.git('update-ref', f'refs/heads/task/{task_id}', revision)
+        return revision
+
+    def integrate_latest(self, candidate):
+        current = self.head()
+        code, _, _ = self._run_git(['merge-base', '--is-ancestor', current, 'HEAD'], cwd=candidate)
+        if code:
+            try:
+                self.git('-c', 'user.name=FunGuys Orchestrator', '-c', 'user.email=orchestrator@funguys.local', 'merge', '--no-edit', current, cwd=candidate)
+            except RuntimeError as exc:
+                self._run_git(['merge', '--abort'], cwd=candidate)
+                raise ValueError('Concurrent changes conflict; refresh this assignment') from exc
+        return current
+
+    def merge_verified(self, candidate, expected_head):
+        self.require_clean()
+        if self.head() != expected_head:
+            raise ValueError('Workspace changed during verification; refresh this assignment')
+        revision = self.git('rev-parse', 'HEAD', cwd=candidate)
+        self.git('merge', '--ff-only', revision)
+        return revision
+
+    def checkpoint(self, task, files, deleted_files=()):
+        if not task.candidate_path:
+            return None
+        candidate = Path(task.candidate_path)
+        if files or deleted_files:
+            self.write_changes(candidate, files, deleted_files)
+        if self.git('status', '--porcelain', '--untracked-files=normal', cwd=candidate):
+            revision = self.commit_candidate(candidate, task.id, task.assigned_agent_id or 'human', 'WIP handoff')
+            self.git('update-ref', f'refs/heads/wip/{task.id}', revision)
+            return revision
+        return self.git('rev-parse', 'HEAD', cwd=candidate)
+
+    def create_handoff_document(self, task_id, from_agent_id, handoff_notes, subgraph_digest):
+        return f'# Handoff: {task_id}\nPrevious worker: {from_agent_id}\n\n{handoff_notes}\n\n{subgraph_digest}'
+
+    def get_workspace_files_bundle(self, target_files=None):
+        return bundle(self.workspace_path)['files']

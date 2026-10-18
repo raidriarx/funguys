@@ -1,116 +1,79 @@
-"""End-to-end automated tests for FunGuys Multi-AI Orchestration Platform."""
-
-from __future__ import annotations
-
+"""End-to-end regressions for authenticated, isolated orchestration."""
 from pathlib import Path
-
+import uuid
+import pytest
 from fastapi.testclient import TestClient
-
 from funguys.host.app import create_host_app
+from funguys.host.qa_pipeline import AutonomousQAPipeline
+from funguys.worker.adapters import generate_task_code_artifact
 
+@pytest.fixture
+def host(tmp_path,monkeypatch):
+    monkeypatch.setenv('FUNGUYS_TRUSTED_EXECUTION','1')
+    app=create_host_app(tmp_path,admin_token='audit-admin-token')
+    with TestClient(app,headers={'Authorization':'Bearer audit-admin-token'}) as client:
+        yield app,client
 
-def test_plan_approval_gate_and_role_based_tier_routing(tmp_path: Path) -> None:
-    app = create_host_app(tmp_path)
-    client = TestClient(app)
+def register(client,name='Alex',profile='codex-pro',quota=0):
+    result=client.post('/api/agents/register',json={'owner_name':name,'machine_name':name+'-pc','profile_key':profile,'initial_used_pct':quota,'worker_id':uuid.uuid4().hex})
+    assert result.status_code==200,result.text
+    return result.json()
 
-    # Register Friend A (Claude Max - Tier 1, 50% used) and Friend B (Gemini CLI - Tier 2, 10% used)
-    r1 = client.post(
-        "/api/agents/register",
-        json={
-            "owner_name": "Alex",
-            "machine_name": "alex-pc",
-            "profile_key": "claude-max",
-            "initial_used_pct": 50.0,
-        },
-    )
-    assert r1.status_code == 200
-    alex_agent = r1.json()
+def approve(client):
+    state=client.get('/api/state').json()
+    result=client.post('/api/project/approve',json={'plan_version':state['project']['plan_version']})
+    assert result.status_code==200,result.text
+    return result.json()
 
-    r2 = client.post(
-        "/api/agents/register",
-        json={
-            "owner_name": "Sam",
-            "machine_name": "sam-laptop",
-            "profile_key": "gemini-cli",
-            "initial_used_pct": 10.0,
-        },
-    )
-    assert r2.status_code == 200
+def submit(client,task,files,**extra):
+    return client.post('/api/tasks/'+task['id']+'/submit',json={'agent_id':task['assigned_agent_id'],'assignment_id':task['assignment_id'],'project_id':task['project_id'],'plan_version':task['plan_version'],'base_revision':task['base_revision'],'submission_id':uuid.uuid4().hex,'files':files,**extra})
 
-    # Before plan approval, no tasks should be IN_PROGRESS
-    state_before = client.get("/api/state").json()
-    assert state_before["project"]["plan_approved"] is False
-    assert all(t["status"] != "in_progress" for t in state_before["tasks"])
+def test_plan_approval_gate_and_role_based_tier_routing(host):
+    app,client=host
+    alex=register(client,'Alex','claude-max',50)
+    register(client,'Sam','gemini-cli',10)
+    before=client.get('/api/state').json()
+    assert not before['project']['plan_approved']
+    assert all(t['status']!='in_progress' for t in before['tasks'])
+    approved=approve(client)
+    task=next(t for t in approved['tasks'] if t['id']=='task-1-contracts')
+    assert task['assigned_agent_id']==alex['id']
+    assert task['assignment_id'] and task['base_revision']
+    assert not (Path(approved['project']['workspace_path'])/'backend/service.py').exists()
 
-    # Approve Plan -> `task-1-contracts` (Tier 1) should be routed to Alex's Claude Max (Tier 1)
-    approve_res = client.post("/api/project/approve", json={}).json()
-    assert approve_res["project"]["plan_approved"] is True
-    t1 = next(t for t in approve_res["tasks"] if t["id"] == "task-1-contracts")
-    assert t1["status"] == "in_progress"
-    assert t1["assigned_agent_id"] == alex_agent["id"]
+def test_baton_pass_handoff_and_full_hackathon_simulation(host,monkeypatch):
+    app,client=host
+    original=client.get('/api/state').json()
+    async def browser(self,*args):
+        return True,'Browser mocked for isolated orchestration regression',None
+    monkeypatch.setattr(AutonomousQAPipeline,'_run_playwright_check',browser)
+    result=client.post('/api/simulate/hackathon')
+    assert result.status_code==200,result.text
+    data=result.json()
+    assert all(t['status']=='completed' for t in data['tasks']),[(t['id'],t['status'],t['blocked_reason'],t['last_error']) for t in data['tasks']]
+    assert next(t for t in data['tasks'] if t['id']=='task-3-tests')['retry_count']==1
+    assert data['graph']['node_count']>=5
+    assert data['contract_alerts']
+    after=client.get('/api/state').json()
+    assert after['project']==original['project']
+    assert after['agents']==original['agents']
+    assert after['tasks']==original['tasks']
 
-
-def test_baton_pass_handoff_and_full_hackathon_simulation(tmp_path: Path) -> None:
-    app = create_host_app(tmp_path)
-    client = TestClient(app)
-
-    sim_res = client.post("/api/simulate/hackathon")
-    assert sim_res.status_code == 200
-    data = sim_res.json()
-
-    # All 3 tasks should be COMPLETED after Baton Pass + QA Bug Auto-Fix
-    for task in data["tasks"]:
-        assert task["status"] == "completed", f"Task {task['id']} did not complete: {task}"
-
-    # Verify `task-3-tests` went through 1 failed QA attempt and passed on retry!
-    t3 = next(t for t in data["tasks"] if t["id"] == "task-3-tests")
-    assert t3["retry_count"] == 1
-
-    # Verify Graphify built the AST knowledge graph and emitted Contract Alerts
-    assert data["graph"]["node_count"] >= 5
-    assert len(data["contract_alerts"]) >= 1
-
-    # Test Graphify query, explain, and path endpoints
-    q_res = client.post("/api/graphify/query", json={"query": "compute_metrics"}).json()
-    assert "compute_metrics" in q_res["result"]
-
-    exp_res = client.post("/api/graphify/explain", json={"query": "create_item"}).json()
-    assert "create_item" in exp_res["result"]
-
-
-def test_circuit_breaker_trips_after_three_failed_qa_attempts(tmp_path: Path) -> None:
-    app = create_host_app(tmp_path)
-    client = TestClient(app)
-
-    agent = client.post(
-        "/api/agents/register",
-        json={
-            "owner_name": "Jordan",
-            "machine_name": "jordan-pc",
-            "profile_key": "codex-pro",
-            "initial_used_pct": 5.0,
-        },
-    ).json()
-    client.post("/api/project/approve", json={})
-
-    # Submit invalid Python syntax 3 times in a row to trigger the Smart Circuit Breaker
-    for attempt in range(1, 4):
-        res = client.post(
-            "/api/tasks/task-1-contracts/submit",
-            json={
-                "agent_id": agent["id"],
-                "files": {"backend/service.py": "def broken_syntax(:\n    pass\n"},
-                "commit_message": f"bad attempt {attempt}",
-            },
-        ).json()
-
-    state = client.get("/api/state").json()
-    t1 = next(t for t in state["tasks"] if t["id"] == "task-1-contracts")
-    assert t1["status"] == "blocked_circuit_breaker"
-    assert t1["circuit_breaker_tripped"] is True
-    assert t1["retry_count"] == 3
-
-    # Human resets circuit breaker -> task becomes ready/in_progress again
-    reset_res = client.post("/api/tasks/task-1-contracts/reset-circuit-breaker")
-    assert reset_res.status_code == 200
-    assert reset_res.json()["circuit_breaker_tripped"] is False
+def test_circuit_breaker_trips_after_three_failed_qa_attempts(host):
+    app,client=host
+    register(client)
+    data=approve(client)
+    main=Path(data['project']['workspace_path'])
+    head=app.state.orchestrator.git.head()
+    for attempt in range(3):
+        task=next(t for t in client.get('/api/state').json()['tasks'] if t['id']=='task-1-contracts')
+        result=submit(client,task,{'backend/service.py':f'# attempt {attempt}\ndef broken(:\n pass\n'})
+        assert result.status_code==200,result.text
+        assert not (main/'backend/service.py').exists()
+        assert app.state.orchestrator.git.head()==head
+    task=next(t for t in client.get('/api/state').json()['tasks'] if t['id']=='task-1-contracts')
+    assert task['status']=='blocked_circuit_breaker'
+    assert task['retry_count']==3
+    result=client.post('/api/tasks/task-1-contracts/reset-circuit-breaker')
+    assert result.status_code==200,result.text
+    assert result.json()['status']=='in_progress'

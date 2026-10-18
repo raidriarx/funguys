@@ -1,177 +1,47 @@
-"""CLI Subscription Wrappers (Claude Code, Gemini CLI, Codex CLI) + Fallback API & Simulation."""
-
+"""Explicit provider adapters; synthesized artifacts are used only by the demo."""
 from __future__ import annotations
-
 import os
-import re
-import shutil
-import subprocess
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any,Dict
+from funguys.worker.runtime import execute_cli, collect_changes, task_prompt, cli_command
+from funguys.host.execution import run_process
 
+def detect_available_clis():
+    import shutil
+    return [profile for binary,profile in [('claude','claude-pro'),('gemini','gemini-cli'),('codex','codex-pro')] if shutil.which(binary)]
 
-RATE_LIMIT_PATTERNS = [
-    r"rate[\s_-]?limit",
-    r"429",
-    r"quota[\s_-]?exceeded",
-    r"usage[\s_-]?limit",
-    r"resets?\s+at",
-    r"too\s+many\s+requests",
-]
+def build_graphify_task_prompt(task, contracts_markdown, subgraph_digest):
+    return task_prompt({'task':task, 'contracts_markdown':contracts_markdown, 'subgraph_digest':subgraph_digest})
 
-
-def detect_available_clis() -> List[str]:
-    """Detect which AI subscription CLIs or fallback API keys are available on this laptop."""
-    detected: List[str] = []
-    if shutil.which("claude"):
-        detected.append("claude-pro")
-    if shutil.which("gemini"):
-        detected.append("gemini-cli")
-    if shutil.which("codex"):
-        detected.append("codex-pro")
-    if any(
-        os.environ.get(k)
-        for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY")
-    ):
-        detected.append("api-fallback")
-    return detected
-
-
-def build_graphify_task_prompt(
-    task: Dict[str, Any],
-    contracts_markdown: str,
-    subgraph_digest: str,
-) -> str:
-    """Build a lean, token-efficient prompt powered by Graphify and CONTRACTS.md."""
-    parts = [
-        "You are an autonomous AI coding agent collaborating in a FunGuys multiplayer session.",
-        f"## Task: {task.get('title')} (`{task.get('id')}`)",
-        task.get("description", ""),
-        f"Target Files: {', '.join(task.get('target_files', []))}",
-        "",
-        "## Shared Interface Contracts (`CONTRACTS.md`)",
-        contracts_markdown.strip(),
-        "",
-        subgraph_digest.strip(),
-    ]
-    if task.get("handoff_digest"):
-        parts.extend(
-            [
-                "",
-                "## Baton-Pass Handoff / Escalation Context",
-                str(task["handoff_digest"]).strip(),
-            ]
-        )
-    if task.get("last_error"):
-        parts.extend(
-            [
-                "",
-                "## Previous QA Failure to Fix",
-                str(task["last_error"])[-1200:],
-            ]
-        )
-    parts.append(
-        "\nCRITICAL EXECUTION RULE: Write ALL listed Target Files directly to disk FIRST before running any shell commands. "
-        "Do NOT create a virtualenv (.venv) or run `pip install`. Write clean, complete, working code into all Target Files so static checks and unit tests pass."
-    )
-    return "\n".join(parts)
-
-
-def is_rate_limited_output(output: str) -> bool:
-    return any(re.search(pat, output, re.IGNORECASE) for pat in RATE_LIMIT_PATTERNS)
-
-
-def run_cli_agent_task(
-    provider: str,
-    work_dir: Path,
-    prompt: str,
-    target_files: List[str],
-    timeout_sec: int = 180,
-) -> Tuple[bool, bool, Dict[str, str], str]:
-    """Invoke a local subscription CLI (`claude`, `gemini`, `codex`) in `work_dir`.
-
-    Returns: `(success, rate_limited, modified_files_dict, raw_output)`
-    """
-    work_dir.mkdir(parents=True, exist_ok=True)
-    existing_targets = [
-        rel for rel in target_files if (work_dir / rel).is_file() and (work_dir / rel).stat().st_size > 50
-    ]
-    missing_targets = [rel for rel in target_files if rel not in existing_targets]
-    if existing_targets and missing_targets:
-        prompt = (
-            f"IMPORTANT WORKSPACE STATE: {existing_targets} ALREADY exist on disk and are implemented. "
-            f"Do NOT rewrite {existing_targets} from scratch! Immediately create and implement the missing target file(s): {missing_targets} FIRST!\n\n"
-            + prompt
-        )
-
-    cmd: Optional[List[str]] = None
-    codex_bin = shutil.which("codex") or r"C:\Users\USER\AppData\Local\Programs\OpenAI\Codex\bin\codex.EXE"
-    if provider == "claude" and shutil.which("claude"):
-        cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
-    elif provider in {"gemini", "google"} and shutil.which("gemini"):
-        cmd = ["gemini", "-p", prompt, "-y"]
-    elif os.path.exists(codex_bin):
-        cmd = [
-            codex_bin,
-            "exec",
-            "-C",
-            str(work_dir),
-            "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
-            prompt,
-        ]
-
-    if not cmd:
-        return False, False, {}, f"CLI binary for '{provider}' not installed locally; using synthesized builder."
-    before_mtimes: Dict[str, float] = {}
-    for p in work_dir.rglob("*"):
-        rel_parts = p.relative_to(work_dir).parts
-        if p.is_file() and not any(part in {".git", ".funguys", "__pycache__", "node_modules", ".venv", ".pytest_cache", ".ruff_cache"} for part in rel_parts):
-            before_mtimes[p.relative_to(work_dir).as_posix()] = p.stat().st_mtime
-
+def run_cli_agent_task(provider, work_dir, prompt, target_files, timeout_sec=240, cancelled=None):
+    if os.environ.get('FUNGUYS_TRUSTED_EXECUTION') != '1':
+        return False, False, {}, 'Host CLI execution is disabled. Use a remote worker or explicitly enable FUNGUYS_TRUSTED_EXECUTION=1 for trusted local projects.'
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(work_dir),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-            encoding="utf-8",
-            errors="replace",
-        )
-        combined = f"{proc.stdout}\n{proc.stderr}".strip()
-        rate_limited = is_rate_limited_output(combined)
-        files_out: Dict[str, str] = {}
-        for rel in target_files:
-            fp = work_dir / rel
-            if fp.exists() and fp.is_file():
-                files_out[rel] = fp.read_text(encoding="utf-8", errors="ignore")
-        for p in work_dir.rglob("*"):
-            rel_parts = p.relative_to(work_dir).parts
-            if p.is_file() and not any(part in {".git", ".funguys", "__pycache__", "node_modules", ".venv", ".pytest_cache", ".ruff_cache"} for part in rel_parts):
-                rel = p.relative_to(work_dir).as_posix()
-                if rel not in before_mtimes or p.stat().st_mtime > before_mtimes[rel]:
-                    if p.stat().st_size <= 250_000:
-                        files_out[rel] = p.read_text(encoding="utf-8", errors="ignore")
-        return proc.returncode == 0 and bool(files_out), rate_limited, files_out, combined
-    except subprocess.TimeoutExpired:
-        files_out: Dict[str, str] = {}
-        for rel in target_files:
-            fp = work_dir / rel
-            if fp.exists() and fp.is_file():
-                files_out[rel] = fp.read_text(encoding="utf-8", errors="ignore")
-        for p in work_dir.rglob("*"):
-            rel_parts = p.relative_to(work_dir).parts
-            if p.is_file() and not any(part in {".git", ".funguys", "__pycache__", "node_modules", ".venv", ".pytest_cache", ".ruff_cache"} for part in rel_parts):
-                rel = p.relative_to(work_dir).as_posix()
-                if rel not in before_mtimes or p.stat().st_mtime > before_mtimes[rel]:
-                    if p.stat().st_size <= 250_000:
-                        files_out[rel] = p.read_text(encoding="utf-8", errors="ignore")
-        return bool(files_out), False, files_out, "CLI execution timed out."
+        ok, limited, output = execute_cli(provider, work_dir, prompt, cancelled=cancelled, timeout=timeout_sec)
+        return ok, limited, {}, output
     except Exception as exc:
-        return False, False, {}, f"CLI execution error: {exc}"
+        return False, False, {}, str(exc)
 
+def run_text_agent(provider, prompt, timeout=90):
+    if os.environ.get('FUNGUYS_TRUSTED_EXECUTION') != '1':
+        raise RuntimeError('Local planning/chat requires FUNGUYS_TRUSTED_EXECUTION=1 and the selected CLI; remote coding tasks remain available.')
+    with tempfile.TemporaryDirectory(prefix='funguys-consult-') as directory:
+        root = Path(directory)
+        command = cli_command(provider, root, prompt)
+        output = root / 'answer.txt'
+        if provider == 'codex':
+            command = [arg if arg != 'workspace-write' else 'read-only' for arg in command]
+            command[-1:-1] = ['--ephemeral', '--output-last-message', str(output)]
+        elif provider == 'claude':
+            command[command.index('--tools') + 1] = ''
+        code, text = run_process(command, root, timeout)
+        if code:
+            raise RuntimeError(f'{provider} consultation failed: {text[-2000:]}')
+        answer = output.read_text(encoding='utf-8') if output.exists() else text
+        if not answer.strip():
+            raise RuntimeError('Selected provider returned an empty answer')
+        return answer.strip()
 
 def generate_task_code_artifact(
     task: Dict[str, Any],
@@ -335,11 +205,4 @@ def test_compute_metrics() -> None:
 '''
         }
 
-    # Generic fallback for any custom user-created task
-    files: Dict[str, str] = {}
-    for target in task.get("target_files", ["output.py"]):
-        if target.endswith(".py"):
-            files[target] = f'"""Auto-generated module for {task.get("title")}."""\n\ndef run() -> bool:\n    return True\n'
-        else:
-            files[target] = f"<!-- {task.get('title')} -->\n<div>Ready</div>\n"
-    return files
+    raise ValueError('Synthetic artifacts are available only for the three explicit demo tasks')

@@ -57,6 +57,7 @@ class GrillArchitectEngine:
 
     def __init__(self) -> None:
         self.session = GrillSession()
+        self.provider = "codex"
 
     def _update_phase(
         self,
@@ -89,7 +90,11 @@ class GrillArchitectEngine:
 
         files_list: List[str] = []
         snippets: List[str] = []
-        for p in sorted(ws.rglob("*")):
+        from funguys.files import source_files
+        for p in source_files(ws):
+            from funguys.files import MAX_FILES
+            if len(files_list)>=MAX_FILES:
+                raise ValueError('Workspace exceeds the planning file limit; exclude generated artifacts or split the project')
             rel_parts = p.relative_to(ws).parts
             if p.is_file() and not any(part in {".git", ".funguys", "__pycache__", "node_modules", ".venv", ".pytest_cache", ".ruff_cache"} for part in rel_parts):
                 rel = str(p.relative_to(ws)).replace("\\", "/")
@@ -120,105 +125,25 @@ class GrillArchitectEngine:
         )
         return len(files_list), files_list, summary
 
-    def _call_architect_llm_json(
-        self,
-        prompt: str,
-        timeout_sec: int = 35,
-        progress_cb: Optional[Any] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Invoke the Lead Architect AI CLI to generate dynamic JSON for Grill-Me turns or Task DAGs."""
-        codex_bin = shutil.which("codex") or r"C:\Users\USER\AppData\Local\Programs\OpenAI\Codex\bin\codex.EXE"
-        if not os.path.exists(codex_bin):
-            self._update_phase(
-                "WARNING_FALLBACK",
-                "Codex CLI binary not found on host; using built-in Architect fallback.",
-                progress_cb,
-                error="Codex CLI binary not found on host PATH.",
-            )
-            return None
-        out_file = os.path.join(tempfile.gettempdir(), f"funguys_grill_{uuid.uuid4().hex[:6]}.txt")
-        full_prompt = (
-            f"{prompt}\n\n"
-            f"CRITICAL INSTRUCTION: Do NOT run any shell commands, file reads, or tool calls. "
-            f"All workspace files and context are already provided above. Respond IMMEDIATELY with ONLY the raw JSON object."
-        )
-        cmd = [
-            codex_bin,
-            "exec",
-            "-C",
-            tempfile.gettempdir(),
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "-o",
-            out_file,
-            full_prompt,
-        ]
-
-        self._update_phase(
-            "CONNECTING_TO_HEAD_BOT",
-            f"Connecting to Lead Architect ({self.session.lead_architect_label})...",
-            progress_cb,
-        )
+    def _call_architect_llm_json(self, prompt, timeout_sec=90, progress_cb=None):
+        from funguys.worker.adapters import run_text_agent
+        self._update_phase("HEAD_BOT_THINKING", f"Consulting selected {self.provider} provider", progress_cb)
         try:
-            self._update_phase(
-                "HEAD_BOT_THINKING",
-                f"{self.session.lead_architect_label} is analyzing {self.session.existing_files_count} workspace file(s) & reasoning...",
-                progress_cb,
-            )
-            proc = subprocess.run(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-            )
-            self._update_phase(
-                "PARSING_RESPONSE",
-                f"Received response from {self.session.lead_architect_label}; parsing JSON payload...",
-                progress_cb,
-            )
-            if os.path.exists(out_file):
-                raw = Path(out_file).read_text(encoding="utf-8", errors="ignore").strip()
+            raw = run_text_agent(self.provider, prompt + "\nReturn only the requested JSON object. Do not call tools.", timeout_sec)
+            decoder = json.JSONDecoder()
+            for start, character in enumerate(raw):
+                if character != "{":
+                    continue
                 try:
-                    os.remove(out_file)
-                except Exception:
-                    pass
-                start = raw.find("{")
-                end = raw.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    parsed = json.loads(raw[start : end + 1])
-                    self.session.last_error = None
-                    return parsed
-                else:
-                    self._update_phase(
-                        "WARNING_FALLBACK",
-                        "Head Bot returned non-JSON output; using structured fallback.",
-                        progress_cb,
-                        error=f"Head Bot output did not contain valid JSON (exit={proc.returncode}).",
-                    )
-            else:
-                stderr_snip = (proc.stderr or proc.stdout or "").strip()[:240]
-                self._update_phase(
-                    "WARNING_FALLBACK",
-                    "Head Bot produced no output file; using structured fallback.",
-                    progress_cb,
-                    error=f"Head Bot CLI exited ({proc.returncode}): {stderr_snip or 'No output'}",
-                )
-        except subprocess.TimeoutExpired:
-            self._update_phase(
-                "WARNING_FALLBACK",
-                f"Head Bot timed out after {timeout_sec}s; using structured fallback so you aren't blocked.",
-                progress_cb,
-                error=f"Head Bot CLI timed out after {timeout_sec}s.",
-            )
+                    result, _ = decoder.raw_decode(raw[start:])
+                except ValueError:
+                    continue
+                if isinstance(result, dict):
+                    return result
+            raise ValueError("Selected architect returned invalid JSON. Retry planning; no fallback plan was substituted.")
         except Exception as exc:
-            self._update_phase(
-                "ERROR",
-                f"Head Bot invocation error: {exc}",
-                progress_cb,
-                error=str(exc),
-            )
-        return None
+            self._update_phase("ERROR", str(exc), progress_cb, error=str(exc))
+            raise
 
     def start_interview(
         self,
@@ -340,20 +265,7 @@ class GrillArchitectEngine:
                 ready_to_compile_hint=bool(llm_q.get("ready_to_compile_hint", step >= 4)),
             )
 
-        # Fallback if CLI is unreachable
-        return GrillQuestion(
-            step=step,
-            total_steps=0,
-            question=f"[Turn {step}] What additional runtime constraints, target platform details, or libraries should we lock in for '{self.session.project_name}'? (Or click [COMPILE_PLAN_&_DAG] if ready)",
-            options=[
-                f"(Recommended) Audit existing {self.session.existing_files_count} workspace files and build the missing execution modules for: {self.session.project_idea}"
-                if self.session.continue_existing
-                else f"(Recommended) Proceed with native execution stack tailored to: {self.session.project_idea}",
-                "Include live CLI/telemetry diagnostics and automated smoke tests",
-                "Modularize into core engine, execution harness, and verification suite",
-            ],
-            ready_to_compile_hint=(step >= 3),
-        )
+        raise ValueError("Architect response did not contain a valid question and options")
 
     def compile_plan_and_tasks(
         self,
@@ -453,10 +365,14 @@ class GrillArchitectEngine:
                         target_files=[str(f) for f in (raw_t.get("target_files") or [f"module_{idx+1}.py"])],
                         exported_symbols=[str(s) for s in (raw_t.get("exported_symbols") or [])],
                         verification_commands=[str(c) for c in (raw_t.get("verification_commands") or [])],
+                        require_tests=bool(raw_t.get("require_tests", False)),
+                        require_browser=bool(raw_t.get("require_browser", False)),
                         status=TaskStatus.READY if not deps else TaskStatus.PENDING,
                         branch_name=f"task/{tid}",
                     )
                 )
+            from funguys.files import validate_dag
+            validate_dag([*([t for t in (existing_tasks or []) if t.status == TaskStatus.COMPLETED and t.id not in {n.id for n in tasks}] if self.session.continue_existing else []), *tasks])
             self.session.status = "drafted"
             self._update_phase(
                 "PLAN_COMPILED",
@@ -469,57 +385,4 @@ class GrillArchitectEngine:
                 "session": self.session.model_dump(),
             }
 
-        # Multi-phase fallback if CLI is unreachable or times out
-        contracts_md = f"# CONTRACTS.md — {name}\n\n## Specification\n{idea}\n\n## Interview Decisions\n{qa_block}\n"
-        tasks = [
-            TaskItem(
-                id="task-p1-core-engine",
-                title=f"[{name}] Phase 1: Core Engine, Tracking & Control Pipeline",
-                description=f"Implement the core tracking, prediction, and device/runtime control engine for {name} per locked specification:\n{idea}\n\n{qa_block}",
-                phase=1,
-                complexity_tier=1,
-                dependencies=[],
-                target_files=["src/core/engine.py", "src/core/calibration.py"],
-                exported_symbols=[],
-                verification_commands=["python -m py_compile src/core/engine.py src/core/calibration.py"],
-                status=TaskStatus.READY,
-                branch_name="task/task-p1-core-engine",
-            ),
-            TaskItem(
-                id="task-p2-desktop-ui",
-                title=f"[{name}] Phase 2: Desktop Window, Live Preview, Calibration & Diagnostics",
-                description=f"Implement the desktop UI, live preview, calibration setup, Start/Pause controls, and 5-second diagnostic bundle recorder for {name}:\n{qa_block}",
-                phase=2,
-                complexity_tier=2,
-                dependencies=["task-p1-core-engine"],
-                target_files=["src/ui/app_window.py", "src/core/diagnostics.py", "run_app.py"],
-                exported_symbols=[],
-                verification_commands=["python -m py_compile src/ui/app_window.py src/core/diagnostics.py run_app.py"],
-                status=TaskStatus.PENDING,
-                branch_name="task/task-p2-desktop-ui",
-            ),
-            TaskItem(
-                id="task-p3-sim-and-packaging",
-                title=f"[{name}] Phase 3: Simulated Gameplay Harness, Guided Device Test & Portable Packaging",
-                description=f"Build the simulated gameplay validation harness, guided live phone latency/FPS test, portable Windows .exe build script, and automated pytest suite for {name}:\n{qa_block}",
-                phase=3,
-                complexity_tier=2,
-                dependencies=["task-p1-core-engine", "task-p2-desktop-ui"],
-                target_files=["src/simulator/gameplay_sim.py", "build_portable.py", "tests/test_bot_suite.py"],
-                exported_symbols=[],
-                verification_commands=["python -m pytest tests/test_bot_suite.py"],
-                status=TaskStatus.PENDING,
-                branch_name="task/task-p3-sim-and-packaging",
-            ),
-        ]
-        self.session.status = "drafted"
-        self._update_phase(
-            "PLAN_COMPILED_FALLBACK",
-            f"Compiled CONTRACTS.md and {len(tasks)}-phase Task DAG from your interview decisions.",
-            progress_cb,
-        )
-        return {
-            "contracts_markdown": contracts_md,
-            "tasks": tasks,
-            "session": self.session.model_dump(),
-        }
+        raise ValueError("Architect response did not contain a valid contracts/task plan; no fallback was substituted")

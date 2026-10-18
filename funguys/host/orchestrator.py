@@ -1,1001 +1,711 @@
-"""Core Multi-AI Orchestrator: Contract-First Planning, Tiered Quota Routing, Baton Pass, and QA Loop."""
-
+"""Versioned, leased orchestration with verification before merge."""
 from __future__ import annotations
-
+import asyncio
+import hashlib
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, List, Optional
-
 from funguys.config import SUBSCRIPTION_PROFILES
-from funguys.db import StateStore
+from funguys.files import bundle, decode_files, validate_dag, validate_relative_path
 from funguys.host.git_manager import GitWorkspaceManager
 from funguys.host.graph_engine import GraphifyEngine
 from funguys.host.qa_pipeline import AutonomousQAPipeline
-from funguys.models import (
-    ActivityEvent,
-    AgentNode,
-    AgentStatus,
-    ContractAlert,
-    ProjectState,
-    QARunReport,
-    TaskItem,
-    TaskStatus,
-    utc_now_iso,
-)
+from funguys.models import ActivityEvent, AgentNode, AgentStatus, ProjectState, TaskItem, TaskStatus, utc_now_iso
 
-BroadcastCallback = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
-
+class ConflictError(ValueError):
+    pass
 
 class FunGuysOrchestrator:
-    """Coordinates multiple teammates' AI subscriptions on the Central Host PC."""
-
-    def __init__(
-        self,
-        store: StateStore,
-        default_workspace: Path,
-        broadcast_cb: Optional[BroadcastCallback] = None,
-    ) -> None:
-        self.store = store
-        self.default_workspace = default_workspace
-        self.broadcast_cb = broadcast_cb
-
-        project = self.store.get_project()
+    def __init__(self, store, default_workspace, broadcast_cb=None):
+        self.store, self.default_workspace, self.broadcast_cb = store, default_workspace, broadcast_cb
+        self._state_lock = asyncio.Lock()
+        self._submission_lock = asyncio.Lock()
+        self._local_running = set()
+        self._local_cancellations = {}
+        self._consulting_agents = set()
+        self._planning = False
+        self.lease_seconds = 90
+        self.chat_history = store.list_chat()
+        project = store.get_project()
         if not project:
-            ws = self.default_workspace / "active_project"
-            ws.mkdir(parents=True, exist_ok=True)
-            project = ProjectState(
-                id="proj-1",
-                name="FunGuys Hackathon Demo Project",
-                description="Full-stack real-time task & analytics web app with REST API, UI dashboard, and automated tests.",
-                workspace_path=str(ws.resolve()),
-                plan_approved=False,
-            )
-            self.store.save_project(project)
+            ws = default_workspace / 'demo_project'
+            project = ProjectState(id='proj-' + uuid.uuid4().hex, name='FunGuys Demo Project', description='Demo tasks; create a project for real work.', workspace_path=str(ws.resolve()))
+            store.save_project(project)
             self._seed_initial_contract_and_tasks(project)
-
-        ws_path = Path(project.workspace_path)
-        self.git = GitWorkspaceManager(ws_path)
-        self.git.ensure_initialized(project.github_url)
-        self.graph = GraphifyEngine(ws_path)
-        self.qa = AutonomousQAPipeline(ws_path)
-        self.graph.build_graph()
-        self.chat_history: List[Dict[str, Any]] = []
-
-    async def emit_event(
-        self,
-        source: str,
-        event_type: str,
-        message: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> ActivityEvent:
-        evt = ActivityEvent(
-            id=f"evt-{uuid.uuid4().hex[:8]}",
-            source=source,
-            event_type=event_type,
-            message=message,
-            metadata=metadata or {},
-        )
-        self.store.add_event(evt)
-        if self.broadcast_cb:
-            await self.broadcast_cb({"type": "event", "event": evt.model_dump()})
-        return evt
-
-    def _seed_initial_contract_and_tasks(self, project: ProjectState) -> None:
-        contracts_md = """# CONTRACTS.md — Shared Interface & Architecture Specification
-
-## 1. Module Ownership Boundaries
-- `backend/models.py` & `backend/api.py`: Core domain models and data service functions (Tier-1 AI).
-- `frontend/index.html` & `frontend/app.js`: Interactive browser dashboard consuming the backend schema (Tier-2 AI).
-- `tests/test_app.py`: Automated pytest verification suite testing domain contracts & edge cases (Tier-2 AI).
-
-## 2. Agreed Function & Schema Contracts
-- `create_item(title: str, priority: int = 1) -> dict`: Returns `{"id": str, "title": str, "priority": int, "completed": bool}`.
-- `list_items() -> list[dict]`: Returns all stored items sorted by priority descending.
-- `compute_metrics(items: list[dict]) -> dict`: Returns `{"total": int, "completed": int, "completion_rate": float}`.
-"""
-        project.contracts_markdown = contracts_md
         self.store.save_project(project)
+        self._activate(project)
+        for task in store.list_tasks():
+            if task.status == TaskStatus.IN_QA or (task.status == TaskStatus.IN_PROGRESS and not task.assignment_id):
+                task.status = TaskStatus.BLOCKED_ENVIRONMENT
+                task.blocked_reason = 'Host restarted during verification. Review and reset this task.'
+                task.assignment_id = None
+                store.save_task(task)
 
+    def _activate(self, project):
+        self.git,self.graph,self.qa = self._prepare_workspace(project)
+
+    def _prepare_workspace(self,project):
+        manager = GitWorkspaceManager(Path(project.workspace_path))
+        manager.ensure_initialized(project.github_url)
+        graph = GraphifyEngine(manager.workspace_path)
+        qa = AutonomousQAPipeline(manager.workspace_path)
+        graph.build_graph()
+        return manager,graph,qa
+
+    def _seed_initial_contract_and_tasks(self, project):
+        project.contracts_markdown = '# Demo contracts\n\nImplement create_item(title, priority=1), list_items(), compute_metrics(items) in backend/service.py.\nMetrics contain total, completed, completion_rate (percent).\n'
         ws = Path(project.workspace_path)
         ws.mkdir(parents=True, exist_ok=True)
-        (ws / "CONTRACTS.md").write_text(contracts_md, encoding="utf-8")
+        (ws / 'CONTRACTS.md').write_text(project.contracts_markdown, encoding='utf-8')
+        tasks = [TaskItem(id='task-1-contracts', title='Core domain service', description='Implement create_item, list_items and compute_metrics.', complexity_tier=1, target_files=['backend/service.py'], status=TaskStatus.READY), TaskItem(id='task-2-frontend', title='Interactive Web UI', description='Build frontend/index.html.', dependencies=['task-1-contracts'], target_files=['frontend/index.html'], require_browser=True), TaskItem(id='task-3-tests', title='Automated service tests', description='Test the service contracts.', dependencies=['task-1-contracts'], target_files=['tests/test_service.py'], require_tests=True)]
+        self.store.replace_tasks(tasks, project)
 
-        initial_tasks = [
-            TaskItem(
-                id="task-1-contracts",
-                title="Core Domain Models & Data Service (`backend/service.py`)",
-                description=(
-                    "Implement `create_item`, `list_items`, and `compute_metrics` in `backend/service.py` "
-                    "matching `CONTRACTS.md`."
-                ),
-                complexity_tier=1,
-                dependencies=[],
-                target_files=["backend/service.py"],
-                exported_symbols=["create_item", "list_items", "compute_metrics"],
-                status=TaskStatus.READY,
-                branch_name="task/task-1-contracts",
-            ),
-            TaskItem(
-                id="task-2-frontend",
-                title="Interactive Web UI (`frontend/index.html`)",
-                description=(
-                    "Create responsive web UI in `frontend/index.html` displaying project items and completion metrics."
-                ),
-                complexity_tier=2,
-                dependencies=["task-1-contracts"],
-                target_files=["frontend/index.html"],
-                exported_symbols=[],
-                status=TaskStatus.PENDING,
-                branch_name="task/task-2-frontend",
-            ),
-            TaskItem(
-                id="task-3-tests",
-                title="Automated Pytest Suite (`tests/test_service.py`)",
-                description=(
-                    "Write comprehensive unit & contract integration tests in `tests/test_service.py` "
-                    "verifying `create_item`, `list_items`, and `compute_metrics`."
-                ),
-                complexity_tier=2,
-                dependencies=["task-1-contracts"],
-                target_files=["tests/test_service.py"],
-                exported_symbols=["test_create_and_list_items", "test_compute_metrics"],
-                status=TaskStatus.PENDING,
-                branch_name="task/task-3-tests",
-            ),
-        ]
-        self.store.clear_tasks()
-        for t in initial_tasks:
-            self.store.save_task(t)
+    async def emit_event(self, source, event_type, message, metadata=None):
+        evt = ActivityEvent(id='evt-' + uuid.uuid4().hex, source=source, event_type=event_type, message=message, metadata=metadata or {})
+        self.store.add_event(evt)
+        if self.broadcast_cb:
+            await self.broadcast_cb({'type': 'event', 'event': evt.model_dump()})
+        return evt
 
-    async def initialize_project(
-        self,
-        name: str,
-        description: str,
-        workspace_path: Optional[str] = None,
-        github_url: Optional[str] = None,
-    ) -> ProjectState:
-        ws = (
-            Path(workspace_path)
-            if workspace_path
-            else (self.default_workspace / name.lower().replace(" ", "_"))
-        )
-        ws.mkdir(parents=True, exist_ok=True)
-        project = ProjectState(
-            id=f"proj-{uuid.uuid4().hex[:6]}",
-            name=name,
-            description=description,
-            workspace_path=str(ws.resolve()),
-            github_url=github_url,
-            plan_approved=False,
-        )
-        self.store.save_project(project)
-        self.git = GitWorkspaceManager(ws)
-        self.git.ensure_initialized(github_url)
-        self.graph = GraphifyEngine(ws)
-        self.qa = AutonomousQAPipeline(ws)
-        self._seed_initial_contract_and_tasks(project)
-        self.graph.build_graph()
-        await self.emit_event(
-            "host",
-            "project_initialized",
-            f"Initialized project '{name}' at {ws}. Waiting for human plan approval.",
-        )
+    def ensure_quiescent(self):
+        if self._local_running or self._submission_lock.locked() or any(t.status in (TaskStatus.IN_PROGRESS, TaskStatus.IN_QA) for t in self.store.list_tasks()):
+            raise ConflictError('Pause active work and wait for execution/verification to stop before replacing project state')
+
+    async def initialize_project(self, name, description, workspace_path=None, github_url=None):
+        async with self._state_lock:
+            self.ensure_quiescent()
+            ws = Path(workspace_path).resolve() if workspace_path else (self.default_workspace / ('project-' + uuid.uuid4().hex[:12])).resolve()
+            project = ProjectState(id='proj-' + uuid.uuid4().hex, name=name.strip() or 'New Project', description=description, workspace_path=str(ws), github_url=github_url)
+            prepared = await asyncio.to_thread(self._prepare_workspace, project)
+            self.store.replace_tasks([], project)
+            self.git,self.graph,self.qa = prepared
+            self._release_agents()
+        await self.emit_event('host', 'project_initialized', f'Initialized {project.name}. Compile and explicitly approve a plan to begin.')
         return project
 
-    async def approve_plan(self, contracts_markdown: Optional[str] = None) -> ProjectState:
-        project = self.store.get_project()
-        assert project is not None
-        if contracts_markdown:
-            project.contracts_markdown = contracts_markdown
-            (Path(project.workspace_path) / "CONTRACTS.md").write_text(
-                contracts_markdown, encoding="utf-8"
-            )
-        project.plan_approved = True
-        self.store.save_project(project)
-        await self.emit_event(
-            "human-team",
-            "plan_approved",
-            "Architecture & Contracts approved! Autonomous multi-AI execution unlocked.",
-        )
-        await self.schedule_ready_tasks()
-        return project
-
-    async def register_agent(
-        self,
-        owner_name: str,
-        machine_name: str,
-        profile_key: str,
-        initial_used_pct: float = 0.0,
-    ) -> AgentNode:
-        import re
-
-        owner_name = re.sub(r"\s+", " ", owner_name).strip() or "My PC"
-        machine_name = re.sub(r"\s+", "", machine_name).strip() or owner_name
-        clean_key = re.sub(r"\s+", "", profile_key).strip().lower()
-        if clean_key not in SUBSCRIPTION_PROFILES:
-            if "codex" in clean_key or "openai" in clean_key or "gpt" in clean_key:
-                clean_key = "codex-pro"
-            elif "gemini" in clean_key or "google" in clean_key:
-                clean_key = "gemini-cli"
-            elif "claude" in clean_key:
-                clean_key = "claude-pro"
-            else:
-                clean_key = "codex-pro"
-        profile_key = clean_key
-        profile = SUBSCRIPTION_PROFILES[profile_key]
-        existing_agents = self.store.list_agents()
-        for existing in existing_agents:
-            if (
-                existing.machine_name.lower() == machine_name.lower()
-                or existing.owner_name.lower() == owner_name.lower()
-            ):
-                existing.profile_key = profile_key
-                existing.provider = profile.provider
-                existing.display_name = f"{owner_name}'s {profile.display_name}"
-                existing.tier = profile.tier
-                self.store.save_agent(existing)
-                await self.emit_event(
-                    existing.id,
-                    "agent_reconnected",
-                    f"{existing.display_name} reconnected from {existing.machine_name}.",
-                )
-                await self.schedule_ready_tasks()
-                return existing
-
-        agent_id = f"{owner_name.lower().replace(' ', '-')}-{profile.provider}-{uuid.uuid4().hex[:4]}"
-        turns_used = int((initial_used_pct / 100.0) * profile.estimated_turns_per_window)
-        agent = AgentNode(
-            id=agent_id,
-            owner_name=owner_name,
-            machine_name=machine_name,
-            profile_key=profile_key,
-            provider=profile.provider,
-            display_name=f"{owner_name}'s {profile.display_name}",
-            tier=profile.tier,
-            status=AgentStatus.IDLE,
-            used_pct=round(initial_used_pct, 1),
-            turns_used=turns_used,
-            turns_limit=profile.estimated_turns_per_window,
-            soft_limit_pct=profile.soft_handoff_threshold_pct,
-        )
-        self.store.save_agent(agent)
-        await self.emit_event(
-            agent.id,
-            "agent_joined",
-            f"{agent.display_name} connected from {machine_name} (Tier {agent.tier}, {100 - agent.used_pct:.0f}% quota available).",
-        )
-        await self.schedule_ready_tasks()
-        return agent
-
-    def select_best_agent_for_task(self, task: TaskItem) -> Optional[AgentNode]:
-        """Role-Based Tier Routing: match task complexity tier to the most efficient available AI."""
-        agents = self.store.list_agents()
-        eligible = [
-            a
-            for a in agents
-            if a.status == AgentStatus.IDLE
-            and a.used_pct < a.soft_limit_pct
-            and a.current_task_id is None
-        ]
-        if not eligible:
-            return None
-
-        # Sort by: (1) Exact tier match first, (2) Lowest used_pct (most remaining quota headroom)
-        eligible.sort(
-            key=lambda a: (0 if a.tier == task.complexity_tier else 1, a.used_pct)
-        )
-        return eligible[0]
-
-    async def schedule_ready_tasks(self) -> List[Dict[str, Any]]:
-        """Promote unlocked PENDING tasks to READY and assign them to optimal idle AIs."""
-        project = self.store.get_project()
-        if not project or not project.plan_approved:
-            return []
-
-        tasks = self.store.list_tasks()
-        in_progress_ids = {t.id for t in tasks if t.status == TaskStatus.IN_PROGRESS}
+    def _release_agents(self):
         for agent in self.store.list_agents():
-            if agent.current_task_id and agent.current_task_id not in in_progress_ids:
+            agent.current_task_id = None
+            if agent.status == AgentStatus.WORKING:
                 agent.status = AgentStatus.IDLE
-                agent.current_task_id = None
-                self.store.save_agent(agent)
-
-        completed_ids = {t.id for t in tasks if t.status == TaskStatus.COMPLETED}
-        assignments: List[Dict[str, Any]] = []
-
-        # Unlock PENDING tasks whose DAG dependencies are all COMPLETED
-        for task in tasks:
-            if task.status == TaskStatus.PENDING and all(
-                dep in completed_ids for dep in task.dependencies
-            ):
-                task.status = TaskStatus.READY
-                task.updated_at = utc_now_iso()
-                self.store.save_task(task)
-
-        # Prioritize HANDOFF_PENDING tasks first (Baton Pass), then READY tasks by complexity tier
-        schedulable = [
-            t
-            for t in self.store.list_tasks()
-            if t.status in {TaskStatus.HANDOFF_PENDING, TaskStatus.READY}
-            and not t.assigned_human
-            and not t.circuit_breaker_tripped
-        ]
-        schedulable.sort(
-            key=lambda t: (0 if t.status == TaskStatus.HANDOFF_PENDING else 1, t.complexity_tier)
-        )
-
-        for task in schedulable:
-            agent = self.select_best_agent_for_task(task)
-            if not agent:
-                break
-
-            was_handoff = task.status == TaskStatus.HANDOFF_PENDING
-            task.status = TaskStatus.IN_PROGRESS
-            task.assigned_agent_id = agent.id
-            task.updated_at = utc_now_iso()
-            self.store.save_task(task)
-
-            agent.status = AgentStatus.WORKING
-            agent.current_task_id = task.id
-            agent.last_heartbeat = utc_now_iso()
             self.store.save_agent(agent)
 
-            subgraph = self.graph.get_subgraph_digest(task.target_files)
-            assignment_payload = {
-                "task": task.model_dump(),
-                "agent": agent.model_dump(),
-                "subgraph_digest": subgraph,
-                "contracts_markdown": project.contracts_markdown,
-                "is_baton_pass": was_handoff,
-            }
-            assignments.append(assignment_payload)
+    async def install_plan(self, tasks, contracts, name=None, description=None, lead_id=None):
+        validate_dag(tasks)
+        async with self._state_lock:
+            self.ensure_quiescent()
+            project = self.store.get_project()
+            project.plan_approved = False
+            project.plan_version = uuid.uuid4().hex
+            project.contracts_markdown = contracts
+            project.name = name or project.name
+            project.description = description or project.description
+            project.lead_architect_agent_id = lead_id
+            for task in tasks:
+                task.project_id, task.plan_version = project.id, project.plan_version
+                task.assignment_id = task.assigned_agent_id = task.candidate_path = task.candidate_revision = None
+            self.store.replace_tasks(tasks, project)
+            self._release_agents()
+        await self.emit_event('planner', 'plan_drafted', 'Plan compiled. Review contracts and explicitly approve this plan version.')
+        return project
 
-            action_label = "Baton-Pass Handoff ->" if was_handoff else "Assigned ->"
-            await self.emit_event(
-                "router",
-                "task_assigned",
-                f"{action_label} `{task.title}` (Tier {task.complexity_tier}) routed to **{agent.display_name}** ({agent.used_pct:.1f}% used).",
-                metadata={"task_id": task.id, "agent_id": agent.id, "baton_pass": was_handoff},
-            )
-            if self.broadcast_cb:
-                await self.broadcast_cb(
-                    {"type": "task_assigned", "assignment": assignment_payload}
-                )
+    async def approve_plan(self, contracts_markdown=None, plan_version=None):
+        async with self._state_lock:
+            if self._planning:
+                raise ConflictError('Planning is still in progress')
+            project = self.store.get_project()
+            if plan_version != project.plan_version:
+                raise ConflictError('The plan changed; review the current version before approval')
+            if project.plan_approved:
+                return project
+            validate_dag(self.store.list_tasks())
+            if not self.store.list_tasks():
+                raise ValueError('Compile or create tasks before approving the plan')
+            if contracts_markdown is not None and contracts_markdown != project.contracts_markdown:
+                project.plan_version = uuid.uuid4().hex
+            project.contracts_markdown = contracts_markdown if contracts_markdown is not None else project.contracts_markdown
+            await asyncio.to_thread(self.git.commit_contracts, project.contracts_markdown)
+            project.plan_approved = True
+            self.store.save_project(project)
+        await self.emit_event('human-team', 'plan_approved', 'Reviewed plan version approved; task execution unlocked.')
+        await self.schedule_ready_tasks()
+        return project
 
+    async def pause_project(self):
+        async with self._state_lock:
+            project = self.store.get_project()
+            project.plan_approved = False
+            self.store.save_project(project)
+            for task in self.store.list_tasks():
+                self._cancel_assignment(task)
+                if task.status == TaskStatus.IN_QA:
+                    task.status = TaskStatus.BLOCKED_ENVIRONMENT
+                    task.blocked_reason = 'Verification cancelled by project pause; reset after review'
+                elif task.status == TaskStatus.IN_PROGRESS:
+                    task.status = TaskStatus.HANDOFF_PENDING
+                else:
+                    continue
+                task.assignment_id = task.assigned_agent_id = task.assigned_human = None
+                self.store.save_task(task)
+            self._release_agents()
+        await self.emit_event('human-team', 'project_paused', 'Project paused; outstanding assignments invalidated.')
+
+    def _cancel_assignment(self, task):
+        cancelled = self._local_cancellations.get(task.assignment_id)
+        if cancelled:
+            cancelled.set()
+
+    async def register_agent(self, owner_name, machine_name, profile_key, initial_used_pct=0, worker_id=None, executor='remote', existing_agent_id=None):
+        if profile_key not in SUBSCRIPTION_PROFILES or not worker_id:
+            raise ValueError('A known subscription profile and persistent worker_id are required')
+        profile = SUBSCRIPTION_PROFILES[profile_key]
+        async with self._state_lock:
+            existing = next((a for a in self.store.list_agents() if a.worker_id == worker_id), None)
+            if existing and existing.id != existing_agent_id:
+                raise ConflictError('Worker already registered; reconnect with its worker credential')
+            if existing:
+                if existing.current_task_id and profile_key != existing.profile_key:
+                    raise ConflictError('Release the active task before changing provider')
+                agent = existing
+                agent.owner_name, agent.machine_name = owner_name.strip(), machine_name.strip()
+            else:
+                agent = AgentNode(id='agent-' + uuid.uuid4().hex, owner_name=owner_name.strip() or 'Teammate', machine_name=machine_name.strip() or 'worker', profile_key=profile_key, provider=profile.provider, display_name=profile.display_name, worker_id=worker_id, executor=executor, used_pct=initial_used_pct)
+                agent.turns_used = int(initial_used_pct * profile.estimated_turns_per_window / 100)
+                if initial_used_pct >= profile.soft_handoff_threshold_pct:
+                    agent.status = AgentStatus.COOLDOWN
+                    agent.cooldown_until = (datetime.now(timezone.utc)+timedelta(hours=profile.window_hours)).isoformat()
+            agent.profile_key, agent.provider, agent.tier = profile_key, profile.provider, profile.tier
+            agent.display_name = f'{agent.owner_name}: {profile.display_name}'
+            agent.turns_limit, agent.soft_limit_pct = profile.estimated_turns_per_window, profile.soft_handoff_threshold_pct
+            agent.last_heartbeat = utc_now_iso()
+            if agent.status == AgentStatus.OFFLINE:
+                agent.status = AgentStatus.IDLE
+            self.store.save_agent(agent)
+        await self.emit_event(agent.id, 'agent_joined', f'{agent.display_name} connected on {agent.machine_name} ({agent.executor}).')
+        await self.schedule_ready_tasks()
+        return self.store.get_agent(agent.id)
+
+    def _refresh_agents(self,only_agent_id=None):
+        now = datetime.now(timezone.utc)
+        agents = [self.store.get_agent(only_agent_id)] if only_agent_id else self.store.list_agents()
+        for agent in agents:
+            if not agent:
+                continue
+            before = agent.model_dump_json()
+            window = SUBSCRIPTION_PROFILES[agent.profile_key].window_hours
+            if (now - datetime.fromisoformat(agent.quota_window_started_at)).total_seconds() >= window * 3600:
+                agent.used_pct, agent.turns_used, agent.cooldown_until = 0, 0, None
+                agent.quota_window_started_at = utc_now_iso()
+                if agent.status == AgentStatus.COOLDOWN:
+                    agent.status = AgentStatus.IDLE
+            if agent.cooldown_until and datetime.fromisoformat(agent.cooldown_until) <= now:
+                agent.used_pct, agent.turns_used, agent.cooldown_until = 0, 0, None
+                agent.quota_window_started_at = utc_now_iso()
+                agent.status = AgentStatus.IDLE
+            if agent.executor == 'remote' and (now - datetime.fromisoformat(agent.last_heartbeat)).total_seconds() > self.lease_seconds:
+                agent.status = AgentStatus.OFFLINE
+            task = self.store.get_task(agent.current_task_id) if agent.current_task_id else None
+            if task and task.status == TaskStatus.IN_PROGRESS and agent.status == AgentStatus.OFFLINE:
+                task.status = TaskStatus.HANDOFF_PENDING
+                task.last_error = 'Worker heartbeat expired; previous assignment invalidated'
+                task.assignment_id = task.assigned_agent_id = None
+                self.store.save_task(task)
+                agent.current_task_id = None
+            elif agent.current_task_id and (not task or task.status not in (TaskStatus.IN_PROGRESS, TaskStatus.IN_QA)):
+                agent.current_task_id = None
+                if agent.status == AgentStatus.WORKING:
+                    agent.status = AgentStatus.IDLE
+            if agent.model_dump_json()!=before:
+                self.store.save_agent(agent)
+
+    def select_best_agent_for_task(self, task,available=None):
+        agents = [a for a in (available if available is not None else self.store.list_agents()) if a.status == AgentStatus.IDLE and a.id not in self._consulting_agents and a.current_task_id is None and a.used_pct < a.soft_limit_pct and (task.complexity_tier != 1 or a.tier == 1)]
+        return min(agents, key=lambda a: (a.tier != task.complexity_tier, a.used_pct, a.id)) if agents else None
+
+    async def schedule_ready_tasks(self):
+        assignments = []
+        async with self._state_lock:
+            self._refresh_agents()
+            project = self.store.get_project()
+            if not project.plan_approved or self._planning:
+                return []
+            completed = {t.id for t in self.store.list_tasks() if t.status == TaskStatus.COMPLETED}
+            available = self.store.list_agents()
+            tasks = sorted(self.store.list_tasks(), key=lambda t: (t.status != TaskStatus.HANDOFF_PENDING, t.phase, t.complexity_tier, t.id))
+            for task in tasks:
+                if len(assignments)>=8:
+                    break
+                if task.status == TaskStatus.PENDING and all(dep in completed for dep in task.dependencies):
+                    task.status = TaskStatus.READY
+                if task.status not in (TaskStatus.READY, TaskStatus.HANDOFF_PENDING) or task.assigned_human:
+                    continue
+                agent = self.select_best_agent_for_task(task,available)
+                if not agent:
+                    task.blocked_reason = 'Waiting for a connected worker with sufficient quota and the required tier'
+                    self.store.save_task(task)
+                    continue
+                assignment_id = uuid.uuid4().hex
+                try:
+                    previous_candidate = task.candidate_path
+                    candidate = await asyncio.to_thread(self.git.prepare_candidate, assignment_id, task.candidate_revision)
+                    await asyncio.to_thread(self.git.integrate_latest, candidate)
+                    base = await asyncio.to_thread(self.git.git, 'rev-parse', 'HEAD', cwd=candidate)
+                except (ValueError, RuntimeError) as exc:
+                    task.status, task.blocked_reason = TaskStatus.BLOCKED_ENVIRONMENT, str(exc)
+                    self.store.save_task(task)
+                    continue
+                task.status, task.assignment_id = TaskStatus.IN_PROGRESS, assignment_id
+                task.project_id, task.plan_version = project.id, project.plan_version
+                task.base_revision, task.candidate_path = base, str(candidate)
+                task.candidate_revision = None
+                task.assigned_agent_id, task.blocked_reason = agent.id, None
+                task.updated_at = utc_now_iso()
+                task.lease_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=self.lease_seconds)).isoformat()
+                agent.status, agent.current_task_id = AgentStatus.WORKING, task.id
+                self.store.save_task(task)
+                self.store.save_agent(agent)
+                assignments.append(self.assignment_payload(task, agent))
+                if previous_candidate and Path(previous_candidate) != candidate:
+                    try:
+                        await asyncio.to_thread(self.git.remove_candidate,Path(previous_candidate))
+                    except (ValueError,RuntimeError,OSError):
+                        pass  # Keep a recoverable artifact if a host filesystem lock prevents cleanup.
+        for assignment in assignments:
+            await self.emit_event('router', 'task_assigned', f"Assigned {assignment['task']['title']} to {assignment['agent']['display_name']}", {'task_id': assignment['task']['id']})
         return assignments
 
-    async def run_autonomous_execution_loop(self, delay_sec: float = 3.0) -> None:
-        """Background worker loop that executes IN_PROGRESS tasks via the AI CLI when unlocked."""
-        import asyncio
-        from funguys.worker.adapters import build_graphify_task_prompt, run_cli_agent_task
+    def public_agent(self, agent):
+        return agent.model_dump(exclude={'credential_hash'})
 
-        if getattr(self, "_auto_loop_running", False):
+    def public_task(self, task):
+        return task.model_dump(exclude={'candidate_path'})
+
+    def assignment_payload(self, task, agent):
+        return {'task': self.public_task(task), 'agent': self.public_agent(agent), 'contracts_markdown': self.store.get_project().contracts_markdown, 'subgraph_digest': self.graph.get_subgraph_digest(task.target_files)}
+
+    def assigned_work(self, agent_id):
+        agent = self.store.get_agent(agent_id)
+        task = self.store.get_task(agent.current_task_id) if agent and agent.current_task_id else None
+        if not task or task.status != TaskStatus.IN_PROGRESS or task.assigned_agent_id != agent_id or not self.store.get_project().plan_approved:
+            return None
+        return self.assignment_payload(task, agent)
+
+    async def heartbeat(self, agent_id, assignment_id=None):
+        async with self._state_lock:
+            self._refresh_agents(agent_id)
+            agent = self.store.get_agent(agent_id)
+            if not agent:
+                raise ValueError('Unknown worker')
+            agent.last_heartbeat = utc_now_iso()
+            if agent.status == AgentStatus.OFFLINE:
+                agent.status = AgentStatus.COOLDOWN if agent.cooldown_until else AgentStatus.IDLE
+            self.store.save_agent(agent)
+            task = self.store.get_task(agent.current_task_id) if agent.current_task_id else None
+            active = bool(task and assignment_id == task.assignment_id and task.status in (TaskStatus.IN_PROGRESS, TaskStatus.IN_QA))
+            if active:
+                task.lease_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=self.lease_seconds)).isoformat()
+                self.store.save_task(task)
+        return {'active': active, 'assignment': self.assigned_work(agent_id)}
+
+    def validate_assignment(self, task_id, agent_id, assignment_id, project_id, plan_version, base_revision=None, human=False):
+        task, project = self.store.get_task(task_id), self.store.get_project()
+        if not task:
+            raise ValueError('Unknown task')
+        if not project.plan_approved or task.project_id != project.id or task.plan_version != project.plan_version:
+            raise ConflictError('Project or plan is no longer approved')
+        if task.status != TaskStatus.IN_PROGRESS or task.assignment_id != assignment_id or task.project_id != project_id or task.plan_version != plan_version:
+            raise ConflictError('Stale or inactive assignment; reload current work')
+        if human:
+            if not task.assigned_human:
+                raise ConflictError('A human must claim this task first')
+        elif not agent_id or task.assigned_agent_id != agent_id or not self.store.get_agent(agent_id):
+            raise ConflictError('Submission does not belong to this worker')
+        if not human:
+            agent = self.store.get_agent(agent_id)
+            if agent.executor == 'remote' and (datetime.now(timezone.utc) - datetime.fromisoformat(agent.last_heartbeat)).total_seconds() > self.lease_seconds:
+                raise ConflictError('Worker lease expired; reconnect and obtain a fresh assignment')
+        if base_revision != task.base_revision:
+            raise ConflictError('Submission base revision does not match this assignment')
+        return task
+
+    async def report_quota_and_check_handoff(self, agent_id, used_pct, turns_delta=1, rate_limited=False, cooldown_minutes=None, handoff_notes=None, wip_files=None, reset_window=False, assignment_id=None, wip_binary_files=None, deleted_files=None):
+        async with self._state_lock:
+            agent = self.store.get_agent(agent_id)
+            if not agent:
+                raise ValueError('Unknown worker')
+            if reset_window:
+                agent.turns_used = 0
+                agent.quota_window_started_at = utc_now_iso()
+            agent.used_pct = min(100, max(0, used_pct))
+            agent.turns_used += turns_delta
+            agent.last_heartbeat = utc_now_iso()
+            handoff = None
+            if rate_limited or used_pct >= agent.soft_limit_pct:
+                task = self.store.get_task(agent.current_task_id) if agent.current_task_id else None
+                if task and task.status == TaskStatus.IN_PROGRESS:
+                    if assignment_id != task.assignment_id:
+                        raise ConflictError('Quota handoff references a stale assignment')
+                    if wip_files or wip_binary_files or deleted_files:
+                        task.candidate_revision = await asyncio.to_thread(self.git.checkpoint, task, decode_files(wip_files or {},wip_binary_files), deleted_files or [])
+                    self._cancel_assignment(task)
+                    task.handoff_digest = self.git.create_handoff_document(task.id, agent.id, handoff_notes or 'Quota reached; resume incomplete work.', self.graph.get_subgraph_digest(task.target_files))
+                    task.status, task.assigned_agent_id, task.assignment_id = TaskStatus.HANDOFF_PENDING, None, None
+                    self.store.save_task(task)
+                    handoff = task.id
+                agent.status = AgentStatus.COOLDOWN
+                if not task or task.status != TaskStatus.IN_QA:
+                    agent.current_task_id = None
+                agent.cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=max(1, min(cooldown_minutes or 60, 1440)))).isoformat()
+            elif agent.status == AgentStatus.COOLDOWN:
+                agent.status, agent.cooldown_until = AgentStatus.IDLE, None
+            self.store.save_agent(agent)
+        if handoff:
+            await self.emit_event(agent.id, 'baton_pass_triggered', f'Quota handoff for {handoff}')
+        assignments = await self.schedule_ready_tasks()
+        return {'agent': self.public_agent(agent), 'handoff': handoff, 'new_assignments': assignments}
+
+    async def delete_agent(self, agent_id):
+        async with self._state_lock:
+            for task in self.store.list_tasks():
+                if task.assigned_agent_id == agent_id and task.status in (TaskStatus.IN_PROGRESS, TaskStatus.IN_QA):
+                    self._cancel_assignment(task)
+                    task.status, task.assignment_id, task.assigned_agent_id = TaskStatus.HANDOFF_PENDING, None, None
+                    task.last_error = 'Assigned worker was removed'
+                    self.store.save_task(task)
+            self.store.delete_agent(agent_id)
+        await self.schedule_ready_tasks()
+
+    async def submit_task_work(self, task_id, agent_id, files, commit_message, used_pct_after=None, *, assignment_id, project_id, plan_version, base_revision, binary_files=None, deleted_files=None, submission_id=None, human=False, _verify_only=False):
+        decoded = decode_files(files, binary_files)
+        deleted_files = [validate_relative_path(p) for p in (deleted_files or [])]
+        if not decoded and not deleted_files and not _verify_only:
+            raise ValueError('No changes submitted; CLI failure does not produce a synthetic implementation')
+        if not submission_id:
+            raise ValueError('A stable submission_id is required')
+        payload_digest = hashlib.sha256(json.dumps({'files': {k: hashlib.sha256(v).hexdigest() for k,v in decoded.items()}, 'deleted': sorted(deleted_files)}, sort_keys=True).encode()).hexdigest()
+        async with self._submission_lock:
+            async with self._state_lock:
+                previous = self.store.get_task(task_id)
+                if previous and previous.submission_id == submission_id:
+                    if previous.submitted_assignment_id != assignment_id or previous.submitted_agent_id != agent_id or previous.project_id != project_id or previous.plan_version != plan_version:
+                        raise ConflictError('Submission receipt belongs to a different assignment or worker')
+                    if previous.submission_digest != payload_digest:
+                        raise ConflictError('Submission ID reused with different content')
+                    return {'status': previous.submission_status, 'task': self.public_task(previous), 'replayed': True}
+                task = self.validate_assignment(task_id, agent_id, assignment_id, project_id, plan_version, base_revision, human)
+                task.status = TaskStatus.IN_QA
+                self.store.save_task(task)
+                manager, candidate, project = self.git, Path(task.candidate_path), self.store.get_project()
+            try:
+                if not _verify_only:
+                    await asyncio.to_thread(manager.write_changes, candidate, decoded, deleted_files)
+                    task.candidate_revision = await asyncio.to_thread(manager.commit_candidate, candidate, task_id, agent_id or task.assigned_human, commit_message)
+                expected_head = await asyncio.to_thread(manager.integrate_latest, candidate)
+                async with self._state_lock:
+                    current = self.store.get_task(task_id)
+                    if not current or current.assignment_id != assignment_id:
+                        raise ConflictError('Assignment invalidated before QA; candidate was not merged')
+                    current.candidate_revision = task.candidate_revision
+                    self.store.save_task(current)
+                qa = AutonomousQAPipeline(candidate)
+                report = await qa.verify_task(task, project.live_preview_url)
+            except Exception as exc:
+                async with self._state_lock:
+                    current = self.store.get_task(task_id)
+                    if current and current.assignment_id == assignment_id:
+                        current.status, current.blocked_reason = TaskStatus.BLOCKED_ENVIRONMENT, str(exc)
+                        current.candidate_revision, current.assignment_id = task.candidate_revision, None
+                        self.store.save_task(current)
+                        self._finish_agent(current, used_pct_after)
+                    elif current and current.candidate_path == str(candidate) and current.status == TaskStatus.BLOCKED_ENVIRONMENT:
+                        current.candidate_revision = task.candidate_revision
+                        self.store.save_task(current)
+                raise
+            report.project_id,report.plan_version = project_id,plan_version
+            self.store.save_qa_report(report)
+            if report.screenshot_path:
+                import shutil
+                origin = qa.screenshots_dir / Path(report.screenshot_path).name
+                if origin.is_file() and not origin.is_symlink():
+                    await asyncio.to_thread(shutil.copyfile, origin, self.qa.screenshots_dir / origin.name)
+            async with self._state_lock:
+                current = self.store.get_task(task_id)
+                active_project = self.store.get_project()
+                if not current or current.assignment_id != assignment_id or active_project.id != project_id or active_project.plan_version != plan_version or not active_project.plan_approved:
+                    raise ConflictError('Assignment invalidated during verification; result was not merged')
+                task.submission_id, task.submission_digest = submission_id, payload_digest
+                task.submitted_assignment_id,task.submitted_agent_id = assignment_id,agent_id
+                if report.overall_passed:
+                    try:
+                        task.candidate_revision = await asyncio.to_thread(manager.merge_verified, candidate, expected_head)
+                    except (RuntimeError, ValueError) as exc:
+                        task.status, task.blocked_reason = TaskStatus.BLOCKED_ENVIRONMENT, str(exc)
+                    else:
+                        task.status, task.last_error = TaskStatus.COMPLETED, None
+                        task.architect_review = 'Automated structural and configured QA checks completed. No model consensus review was performed.'
+                elif report.environment_blocked:
+                    task.status, task.blocked_reason, task.last_error = TaskStatus.BLOCKED_ENVIRONMENT, report.logs, report.logs
+                else:
+                    task.retry_count += 1
+                    task.last_error = report.logs
+                    if task.retry_count >= task.max_retries:
+                        task.status, task.circuit_breaker_tripped = TaskStatus.BLOCKED_CIRCUIT_BREAKER, True
+                    else:
+                        task.status = TaskStatus.READY
+                        if task.retry_count == 2:
+                            task.complexity_tier = 1
+                self._finish_agent(task, used_pct_after)
+                if task.status != TaskStatus.COMPLETED:
+                    task.assigned_agent_id, task.assignment_id = None, None
+                if task.assigned_human and task.status == TaskStatus.READY:
+                    task.blocked_reason = 'Human retry required; reclaim or release this task'
+                task.updated_at = utc_now_iso()
+                task.submission_status = task.status.value
+                self.store.save_task(task)
+            if task.status == TaskStatus.COMPLETED:
+                try:
+                    _, alerts = await asyncio.to_thread(self.graph.scan_and_detect_contract_deltas, task.id, agent_id or 'human', self.store.list_tasks())
+                except Exception as exc:
+                    alerts = []
+                    self.graph.last_error = str(exc)
+                    self.graph.last_graph_data['warnings'] = ['Graph update failed: '+str(exc)]
+                    await self.emit_event('graph','graph_update_failed',str(exc))
+                for alert in alerts:
+                    alert.project_id,alert.plan_version = project_id,plan_version
+                    self.store.save_contract_alert(alert)
+                async with self._state_lock:
+                    for other in self.store.list_tasks():
+                        notices = [a.summary for a in alerts if other.id in a.dependent_task_ids]
+                        if notices:
+                            other.handoff_digest = (other.handoff_digest or '') + '\nContract updates to reconcile:\n' + '\n'.join(notices)
+                            if other.status == TaskStatus.IN_PROGRESS and other.assigned_agent_id:
+                                self._cancel_assignment(other)
+                                self._finish_agent(other)
+                                other.status,other.assignment_id,other.assigned_agent_id = TaskStatus.HANDOFF_PENDING,None,None
+                                other.blocked_reason = 'Contract changed; refreshing assignment context'
+                            self.store.save_task(other)
+                try:
+                    await asyncio.to_thread(manager.remove_candidate,candidate)
+                    task.candidate_path = None
+                    self.store.save_task(task)
+                except (ValueError,RuntimeError,OSError):
+                    await self.emit_event('host','cleanup_pending',f'Verified worktree retained for {task.id}; cleanup can be retried after filesystem locks clear')
+            await self.emit_event('qa', 'qa_result', f'{task.title}: {task.status.value}. {report.checks}', {'task_id': task.id})
+            assignments = await self.schedule_ready_tasks()
+            return {'status': task.status.value, 'task': self.public_task(task), 'qa_report': report.model_dump(), 'next_assignments': assignments}
+
+    async def retry_verification(self, task_id):
+        async with self._state_lock:
+            task = self.store.get_task(task_id)
+            project = self.store.get_project()
+            if not task or task.status != TaskStatus.BLOCKED_ENVIRONMENT or not task.candidate_revision or not task.candidate_path:
+                raise ConflictError('No retained candidate is available for QA recheck')
+            if not project.plan_approved or task.project_id != project.id or task.plan_version != project.plan_version:
+                raise ConflictError('Approve the current plan before rechecking its candidate')
+            previous_human = task.assigned_human
+            task.assigned_human,task.assigned_agent_id = 'QA recheck',None
+            task.status,task.assignment_id = TaskStatus.IN_PROGRESS,uuid.uuid4().hex
+            task.blocked_reason = None
+            self.store.save_task(task)
+        try:
+            return await self.submit_task_work(task.id,None,{},'Recheck retained candidate',assignment_id=task.assignment_id,project_id=task.project_id,plan_version=task.plan_version,base_revision=task.base_revision,submission_id=uuid.uuid4().hex,human=True,_verify_only=True)
+        finally:
+            async with self._state_lock:
+                current = self.store.get_task(task_id)
+                if current and current.assigned_human == 'QA recheck':
+                    current.assigned_human = previous_human
+                    self.store.save_task(current)
+            await self.schedule_ready_tasks()
+
+    def _finish_agent(self, task, used_pct_after=None):
+        agent = self.store.get_agent(task.assigned_agent_id) if task.assigned_agent_id else None
+        if not agent or agent.current_task_id != task.id:
+            return
+        agent.current_task_id = None
+        agent.turns_used += 1
+        if used_pct_after is not None:
+            agent.used_pct = min(100, max(0, used_pct_after))
+        else:
+            agent.used_pct = min(100,max(agent.used_pct,round(agent.turns_used/max(1,agent.turns_limit)*100,1)))
+        agent.status = AgentStatus.COOLDOWN if agent.used_pct >= agent.soft_limit_pct else AgentStatus.IDLE
+        if agent.status == AgentStatus.COOLDOWN:
+            if not agent.cooldown_until:
+                agent.cooldown_until = (datetime.now(timezone.utc) + timedelta(hours=SUBSCRIPTION_PROFILES[agent.profile_key].window_hours)).isoformat()
+        else:
+            agent.cooldown_until = None
+        self.store.save_agent(agent)
+
+    async def fail_execution(self, task_id, agent_id, assignment_id, error):
+        async with self._state_lock:
+            task = self.store.get_task(task_id)
+            if not task or task.assignment_id != assignment_id or task.assigned_agent_id != agent_id or task.status != TaskStatus.IN_PROGRESS:
+                raise ConflictError('Stale execution failure')
+            task.execution_failures += 1
+            task.last_error = error[:10000]
+            task.status, task.blocked_reason = TaskStatus.BLOCKED_ENVIRONMENT, 'Execution failed; fix the worker environment and explicitly reset this task'
+            task.assignment_id = None
+            self._finish_agent(task)
+            task.assigned_agent_id = None
+            self.store.save_task(task)
+        await self.schedule_ready_tasks()
+        return self.public_task(task)
+
+    async def claim_task_by_human(self, task_id, human_name):
+        async with self._state_lock:
+            project, task = self.store.get_project(), self.store.get_task(task_id)
+            if not task or not project.plan_approved:
+                raise ConflictError('Approve the plan before claiming work')
+            completed = {t.id for t in self.store.list_tasks() if t.status == TaskStatus.COMPLETED}
+            if not all(d in completed for d in task.dependencies) or task.status in (TaskStatus.COMPLETED, TaskStatus.IN_QA):
+                raise ConflictError('Task is completed, verifying, or waiting for dependencies')
+            if task.status == TaskStatus.IN_PROGRESS and not task.assigned_human:
+                self._cancel_assignment(task)
+                self._finish_agent(task)
+            if task.status in (TaskStatus.BLOCKED_ENVIRONMENT,TaskStatus.BLOCKED_CIRCUIT_BREAKER):
+                task.circuit_breaker_tripped,task.retry_count,task.blocked_reason = False,0,None
+            task.assignment_id = uuid.uuid4().hex
+            candidate = await asyncio.to_thread(self.git.prepare_candidate, task.assignment_id, task.candidate_revision)
+            await asyncio.to_thread(self.git.integrate_latest, candidate)
+            task.base_revision = await asyncio.to_thread(self.git.git, 'rev-parse', 'HEAD', cwd=candidate)
+            task.candidate_path = str(candidate)
+            task.project_id, task.plan_version = project.id, project.plan_version
+            task.assigned_human, task.assigned_agent_id = human_name.strip() or 'Human', None
+            task.status = TaskStatus.IN_PROGRESS
+            self.store.save_task(task)
+        return task
+
+    async def release_human(self, task_id):
+        async with self._state_lock:
+            task = self.store.get_task(task_id)
+            if not task or not task.assigned_human or task.status == TaskStatus.IN_QA:
+                raise ConflictError('No releasable human task')
+            task.assigned_human, task.assignment_id = None, None
+            if task.status not in (TaskStatus.BLOCKED_ENVIRONMENT,TaskStatus.BLOCKED_CIRCUIT_BREAKER):
+                task.status = TaskStatus.READY
+            self.store.save_task(task)
+        await self.schedule_ready_tasks()
+        return self.store.get_task(task_id)
+
+    async def reset_circuit_breaker(self, task_id):
+        async with self._state_lock:
+            task = self.store.get_task(task_id)
+            if not task or task.status not in (TaskStatus.BLOCKED_CIRCUIT_BREAKER, TaskStatus.BLOCKED_ENVIRONMENT):
+                raise ConflictError('Only blocked tasks can be reset')
+            task.retry_count, task.execution_failures = 0, 0
+            if task.blocked_reason and 'conflict' in task.blocked_reason.lower():
+                task.candidate_revision = None
+            task.circuit_breaker_tripped, task.blocked_reason = False, None
+            task.status, task.assignment_id, task.assigned_human = TaskStatus.READY, None, None
+            self.store.save_task(task)
+        await self.schedule_ready_tasks()
+        return self.store.get_task(task_id)
+
+    async def clear_tasks(self):
+        async with self._state_lock:
+            self.ensure_quiescent()
+            project = self.store.get_project()
+            project.plan_approved = False
+            project.plan_version = uuid.uuid4().hex
+            self.store.replace_tasks([], project)
+            self._release_agents()
+
+    async def add_task(self, task):
+        async with self._state_lock:
+            if self._planning or self.store.get_project().plan_approved:
+                raise ConflictError('Pause the project before changing the reviewed task plan')
+            self.ensure_quiescent()
+            tasks = self.store.list_tasks()
+            if any(t.id == task.id for t in tasks):
+                raise ConflictError('Task ID already exists')
+            validate_dag([*tasks, task])
+            task.status = TaskStatus.PENDING if task.dependencies else TaskStatus.READY
+            self.store.save_task(task)
+            project = self.store.get_project()
+            project.plan_version = uuid.uuid4().hex
+            self.store.save_project(project)
+        await self.schedule_ready_tasks()
+        return self.store.get_task(task.id)
+
+    async def run_autonomous_execution_loop(self, delay_sec=0):
+        """Only explicit local executors run here; remote assignments stay remote."""
+        from funguys.worker.adapters import build_graphify_task_prompt, run_cli_agent_task
+        from funguys.worker.runtime import write_snapshot, collect_changes
+        import tempfile
+        import threading
+        if getattr(self, '_auto_loop_running', False):
             return
         self._auto_loop_running = True
         try:
             await asyncio.sleep(delay_sec)
-            while True:
-                project = self.store.get_project()
-                if not project or not project.plan_approved:
-                    break
-                in_prog = [
-                    t
-                    for t in self.store.list_tasks()
-                    if t.status == TaskStatus.IN_PROGRESS
-                    and t.assigned_agent_id
-                    and not t.assigned_human
-                    and not t.circuit_breaker_tripped
-                ]
-                if not in_prog:
-                    # Try scheduling any newly ready tasks
-                    await self.schedule_ready_tasks()
-                    in_prog = [
-                        t
-                        for t in self.store.list_tasks()
-                        if t.status == TaskStatus.IN_PROGRESS
-                        and t.assigned_agent_id
-                        and not t.assigned_human
-                        and not t.circuit_breaker_tripped
-                    ]
-                    if not in_prog:
-                        break
-
-                for task in in_prog:
-                    agent = self.store.get_agent(task.assigned_agent_id) if task.assigned_agent_id else None
-                    if not agent:
-                        continue
-                    await self.emit_event(
-                        agent.machine_name,
-                        "task_executing",
-                        f"⚡ **[{agent.machine_name}]** ({agent.display_name}) is building Phase {task.phase} task `{task.id}`: **{task.title}** (`{', '.join(task.target_files)}`)...",
-                        metadata={"task_id": task.id, "agent_id": agent.id},
-                    )
-                    subgraph = self.graph.get_subgraph_digest(task.target_files)
-                    prompt = build_graphify_task_prompt(
-                        task.model_dump(),
-                        project.contracts_markdown,
-                        subgraph,
-                    )
-                    ws_dir = Path(project.workspace_path)
-                    ok, rate_limited, files_out, raw_out = await asyncio.to_thread(
-                        run_cli_agent_task,
-                        agent.provider,
-                        ws_dir,
-                        prompt,
-                        task.target_files,
-                        240,
-                    )
-                    # Re-check if a remote worker already submitted while we were running
-                    fresh_task = self.store.get_task(task.id)
-                    if not fresh_task or fresh_task.status != TaskStatus.IN_PROGRESS:
-                        continue
-
-                    if not files_out:
-                        # Ensure target files exist if the CLI wrote to a slightly different path or stub
-                        for rel in task.target_files:
-                            fp = ws_dir / rel
-                            if fp.exists() and fp.is_file():
-                                files_out[rel] = fp.read_text(encoding="utf-8", errors="ignore")
-
-                    if files_out:
-                        await self.submit_task_work(
-                            task_id=task.id,
-                            agent_id=agent.id,
-                            files=files_out,
-                            commit_message=f"feat({task.id}): implemented {task.title} by {agent.machine_name}",
-                        )
-                    else:
-                        await self.emit_event(
-                            agent.machine_name,
-                            "task_warning",
-                            f"⚠️ **[{agent.machine_name}]** CLI run finished for `{task.id}` without target files ({raw_out[:160]}).",
-                        )
-                        break
-                await asyncio.sleep(1.5)
+            for task in self.store.list_tasks():
+                agent = self.store.get_agent(task.assigned_agent_id) if task.assigned_agent_id else None
+                if task.status != TaskStatus.IN_PROGRESS or not agent or agent.executor != 'local':
+                    continue
+                self._local_running.add(task.assignment_id)
+                cancelled = threading.Event()
+                self._local_cancellations[task.assignment_id] = cancelled
+                try:
+                    payload = self.assignment_payload(task, agent)
+                    with tempfile.TemporaryDirectory(prefix='funguys-local-') as scratch:
+                        snapshot = await asyncio.to_thread(bundle, Path(task.candidate_path))
+                        await asyncio.to_thread(write_snapshot, Path(scratch), snapshot)
+                        prompt = build_graphify_task_prompt(payload['task'], payload['contracts_markdown'], payload['subgraph_digest'])
+                        ok, limited, _, output = await asyncio.to_thread(run_cli_agent_task, agent.provider, Path(scratch), prompt, task.target_files, 240, cancelled)
+                        fresh = self.store.get_task(task.id)
+                        if not fresh or fresh.assignment_id != task.assignment_id or fresh.status != TaskStatus.IN_PROGRESS:
+                            continue
+                        if limited:
+                            changes = await asyncio.to_thread(collect_changes, Path(scratch), snapshot)
+                            await self.report_quota_and_check_handoff(agent.id, 100, rate_limited=True, assignment_id=task.assignment_id, handoff_notes=output[-1000:], wip_files=changes['files'],wip_binary_files=changes['binary_files'],deleted_files=changes['deleted_files'])
+                        elif ok:
+                            changes = await asyncio.to_thread(collect_changes, Path(scratch), snapshot)
+                            await self.submit_task_work(task.id, agent.id, changes['files'], 'Local worker implementation', assignment_id=task.assignment_id, project_id=task.project_id, plan_version=task.plan_version, base_revision=task.base_revision, binary_files=changes['binary_files'], deleted_files=changes['deleted_files'], submission_id=uuid.uuid4().hex)
+                        else:
+                            await self.fail_execution(task.id, agent.id, task.assignment_id, output)
+                except Exception as exc:
+                    fresh = self.store.get_task(task.id)
+                    if fresh and fresh.assignment_id == task.assignment_id and fresh.status == TaskStatus.IN_PROGRESS:
+                        await self.fail_execution(task.id, agent.id, task.assignment_id, str(exc))
+                finally:
+                    cancelled.set()
+                    self._local_cancellations.pop(task.assignment_id,None)
+                    self._local_running.discard(task.assignment_id)
         finally:
             self._auto_loop_running = False
 
-    async def report_quota_and_check_handoff(
-        self,
-        agent_id: str,
-        used_pct: float,
-        turns_delta: int = 1,
-        rate_limited: bool = False,
-        cooldown_minutes: Optional[int] = None,
-        handoff_notes: Optional[str] = None,
-        wip_files: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        """Update an AI's quota usage and trigger an automatic Baton Pass if >=80% or rate-limited."""
-        agent = self.store.get_agent(agent_id)
-        if not agent:
-            raise ValueError(f"Unknown agent: {agent_id}")
-
-        agent.used_pct = min(100.0, max(agent.used_pct, round(used_pct, 1)))
-        agent.turns_used += turns_delta
-        agent.last_heartbeat = utc_now_iso()
-
-        needs_handoff = rate_limited or (agent.used_pct >= agent.soft_limit_pct)
-        handoff_result: Optional[Dict[str, Any]] = None
-
-        if needs_handoff and agent.current_task_id:
-            task = self.store.get_task(agent.current_task_id)
-            if task and task.status == TaskStatus.IN_PROGRESS:
-                if wip_files:
-                    self.git.apply_worker_changes(
-                        task.id,
-                        agent.id,
-                        wip_files,
-                        commit_message="WIP checkpoint before quota handoff",
-                        is_wip=True,
-                    )
-                    self.graph.build_graph()
-
-                subgraph_digest = self.graph.get_subgraph_digest(task.target_files)
-                notes = handoff_notes or (
-                    f"Completed initial scaffolding for {', '.join(task.target_files)}. "
-                    f"Paused at {agent.used_pct:.1f}% quota limit. Finish remaining logic & run QA."
-                )
-                digest_md = self.git.create_handoff_document(
-                    task.id, agent.id, notes, subgraph_digest
-                )
-
-                task.status = TaskStatus.HANDOFF_PENDING
-                task.assigned_agent_id = None
-                task.branch_name = f"wip/{task.id}"
-                task.handoff_digest = digest_md
-                task.updated_at = utc_now_iso()
-                self.store.save_task(task)
-
-                cd_mins = cooldown_minutes or 60
-                agent.status = AgentStatus.COOLDOWN
-                agent.current_task_id = None
-                agent.cooldown_until = (
-                    datetime.now(timezone.utc) + timedelta(minutes=cd_mins)
-                ).isoformat()
-                self.store.save_agent(agent)
-
-                reason = "HTTP 429 Rate Limit" if rate_limited else f"Soft Quota Threshold ({agent.used_pct:.1f}% >= {agent.soft_limit_pct:.0f}%)"
-                await self.emit_event(
-                    agent.id,
-                    "baton_pass_triggered",
-                    f"⚡ Baton Pass triggered on `{task.id}` due to {reason}. Committed `wip/{task.id}` & generated Graphify handoff digest.",
-                    metadata={"task_id": task.id, "from_agent": agent.id},
-                )
-                new_assignments = await self.schedule_ready_tasks()
-                handoff_result = {
-                    "handed_off_task": task.id,
-                    "handoff_digest": digest_md,
-                    "new_assignments": new_assignments,
-                }
-        else:
-            self.store.save_agent(agent)
-
-        return {"agent": agent.model_dump(), "handoff": handoff_result}
-
-    async def submit_task_work(
-        self,
-        task_id: str,
-        agent_id: str,
-        files: Dict[str, str],
-        commit_message: str,
-        used_pct_after: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Commit worker files, run Graphify contract delta analysis, and run 3-layer QA."""
-        task = self.store.get_task(task_id)
-        if not task:
-            raise ValueError(f"Unknown task: {task_id}")
-        agent = self.store.get_agent(agent_id)
-
-        task.status = TaskStatus.IN_QA
-        task.updated_at = utc_now_iso()
-        self.store.save_task(task)
-
-        # 1. Commit code to Host Git repo
-        self.git.apply_worker_changes(task_id, agent_id, files, commit_message, is_wip=False)
-
-        # 2. Run deterministic Graphify pass & detect contract signature changes
-        all_tasks = self.store.list_tasks()
-        graph_data, alerts = self.graph.scan_and_detect_contract_deltas(
-            task_id, agent_id, all_tasks
-        )
-        for alert in alerts:
-            self.store.save_contract_alert(alert)
-            await self.emit_event(
-                "graphify",
-                "contract_delta",
-                alert.summary,
-                metadata=alert.model_dump(),
-            )
-
-        # 3. Run 3-Layer Autonomous QA Pipeline on Host PC
-        project = self.store.get_project()
-        qa_report = await self.qa.verify_task(
-            task, live_preview_url=project.live_preview_url if project else None
-        )
-        self.store.save_qa_report(qa_report)
-
-        # Update agent status & quota
-        if agent:
-            agent.turns_used += 1
-            if used_pct_after is not None:
-                agent.used_pct = min(100.0, round(used_pct_after, 1))
-            else:
-                agent.used_pct = min(
-                    100.0, round((agent.turns_used / max(1, agent.turns_limit)) * 100.0, 1)
-                )
-            agent.status = (
-                AgentStatus.COOLDOWN
-                if agent.used_pct >= agent.soft_limit_pct
-                else AgentStatus.IDLE
-            )
-            agent.current_task_id = None
-            agent.last_heartbeat = utc_now_iso()
-            self.store.save_agent(agent)
-
-        if qa_report.overall_passed:
-            task.status = TaskStatus.COMPLETED
-            task.last_error = None
-            task.updated_at = utc_now_iso()
-            self.store.save_task(task)
-            await self.emit_event(
-                "qa-pipeline",
-                "qa_passed",
-                f"✅ `{task.title}` PASSED all QA layers and merged to `main`!",
-                metadata={"task_id": task.id, "qa_id": qa_report.id},
-            )
-            await self._run_architect_and_consensus_review(task, agent_id, files, alerts)
-            next_assignments = await self.schedule_ready_tasks()
-            return {
-                "status": "completed",
-                "task": self.store.get_task(task.id).model_dump() if self.store.get_task(task.id) else task.model_dump(),
-                "qa_report": qa_report.model_dump(),
-                "contract_alerts": [a.model_dump() for a in alerts],
-                "next_assignments": next_assignments,
-            }
-
-        # QA Failed -> Apply Smart Escalation + Circuit Breaker
-        task.retry_count += 1
-        task.last_error = qa_report.logs
-        task.assigned_agent_id = None
-
-        if task.retry_count >= task.max_retries:
-            task.status = TaskStatus.BLOCKED_CIRCUIT_BREAKER
-            task.circuit_breaker_tripped = True
-            self.store.save_task(task)
-            await self.emit_event(
-                "circuit-breaker",
-                "circuit_breaker_tripped",
-                f"🛑 Circuit Breaker tripped on `{task.title}` after {task.retry_count} failed QA attempts. Paused to protect team AI quota — human attention requested!",
-                metadata={"task_id": task.id, "qa_id": qa_report.id},
-            )
-            return {
-                "status": "circuit_breaker_tripped",
-                "task": task.model_dump(),
-                "qa_report": qa_report.model_dump(),
-            }
-
-        if task.retry_count == 2:
-            # Escalate to Tier-1 Debugging AI with Graphify context
-            task.complexity_tier = 1
-            subgraph_ctx = self.graph.get_subgraph_digest(task.target_files)
-            task.handoff_digest = (
-                f"### Escalated to Tier-1 Debugger (Attempt {task.retry_count + 1})\n"
-                f"Previous QA failure:\n```\n{qa_report.logs[-600:]}\n```\n\n{subgraph_ctx}"
-            )
-            task.status = TaskStatus.HANDOFF_PENDING
-            self.store.save_task(task)
-            await self.emit_event(
-                "qa-pipeline",
-                "qa_escalated_tier1",
-                f"⚠️ `{task.title}` failed QA twice. Escalating to **Tier-1 Debugger AI** with Graphify call-path context!",
-                metadata={"task_id": task.id, "retry_count": task.retry_count},
-            )
-        else:
-            task.status = TaskStatus.READY
-            self.store.save_task(task)
-            await self.emit_event(
-                "qa-pipeline",
-                "qa_retry",
-                f"🔄 `{task.title}` failed QA (Attempt {task.retry_count}/{task.max_retries}). Scheduling automated bug-fix retry.",
-                metadata={"task_id": task.id, "retry_count": task.retry_count},
-            )
-
-        next_assignments = await self.schedule_ready_tasks()
-        return {
-            "status": "retry_scheduled",
-            "task": task.model_dump(),
-            "qa_report": qa_report.model_dump(),
-            "next_assignments": next_assignments,
-        }
-
-    async def _run_architect_and_consensus_review(
-        self,
-        task: TaskItem,
-        submitting_agent_id: str,
-        files: Dict[str, str],
-        alerts: List[ContractAlert],
-    ) -> None:
-        """Lead Architect AI checks what each bot added in each phase; for bigger changes all bots review together."""
-        project = self.store.get_project()
-        agents = self.store.list_agents()
-        all_tasks = self.store.list_tasks()
-
-        lead_agent: Optional[AgentNode] = None
-        if project and project.lead_architect_agent_id:
-            lead_agent = next((a for a in agents if a.id == project.lead_architect_agent_id), None)
-        if not lead_agent and agents:
-            lead_agent = sorted(agents, key=lambda a: (a.tier, a.used_pct))[0]
-
-        lead_name = lead_agent.machine_name if lead_agent else "Lead-Architect"
-        added_files = list(files.keys())
-        extra_files = [f for f in added_files if f not in task.target_files]
-
-        # Check if an entire phase just finished or if contract deltas / extra files were introduced
-        same_phase_tasks = [t for t in all_tasks if t.phase == task.phase]
-        phase_completed = all(t.status == TaskStatus.COMPLETED for t in same_phase_tasks)
-        is_major_change = bool(alerts) or bool(extra_files) or phase_completed
-
-        review_summary = (
-            f"[{lead_name} Phase-{task.phase} Audit] Verified {len(added_files)} file(s): {', '.join(added_files)}."
-        )
-        if extra_files:
-            review_summary += f" New auxiliary files detected: {', '.join(extra_files)}."
-        if alerts:
-            review_summary += f" Contract signature updates: {len(alerts)}."
-
-        await self.emit_event(
-            lead_name,
-            "architect_phase_review",
-            f"🧐 **Lead Architect ({lead_name})** reviewed `{task.id}` (Phase {task.phase}): {review_summary}",
-            metadata={"task_id": task.id, "phase": task.phase, "files": added_files},
-        )
-
-        if is_major_change and len(agents) > 1:
-            bot_names = ", ".join(f"**{a.machine_name}** ({a.display_name})" for a in agents)
-            reason = (
-                f"Phase {task.phase} boundary completed"
-                if phase_completed
-                else f"Cross-cutting changes ({len(alerts)} contract deltas, {len(extra_files)} new files)"
-            )
-            consensus_note = (
-                f"[ALL-BOTS CONSENSUS SYNC] ({reason}): {bot_names} reviewed `{', '.join(added_files)}` "
-                f"and aligned interfaces for downstream Phase {task.phase + 1} tasks."
-            )
-            review_summary += f" | {consensus_note}"
-            await self.emit_event(
-                "all-bots-council",
-                "consensus_sync",
-                f"🤝 **Multi-Bot Consensus Check:** {consensus_note}",
-                metadata={"task_id": task.id, "phase": task.phase, "bots": [a.machine_name for a in agents]},
-            )
-
-        task.architect_review = review_summary
-        self.store.save_task(task)
-
-    async def claim_task_by_human(self, task_id: str, human_name: str) -> TaskItem:
-        """Allow a human teammate to claim a task alongside the AIs."""
-        task = self.store.get_task(task_id)
-        if not task:
-            raise ValueError(f"Unknown task: {task_id}")
-        task.assigned_human = human_name
-        task.assigned_agent_id = None
-        task.status = TaskStatus.IN_PROGRESS
-        task.updated_at = utc_now_iso()
-        self.store.save_task(task)
-        await self.emit_event(
-            human_name,
-            "human_claimed_task",
-            f"👩‍💻 Teammate **{human_name}** claimed `{task.title}` for manual coding.",
-            metadata={"task_id": task.id, "human": human_name},
-        )
-        return task
-
-    async def reset_circuit_breaker(self, task_id: str) -> TaskItem:
-        """Reset a tripped circuit breaker after human review."""
-        task = self.store.get_task(task_id)
-        if not task:
-            raise ValueError(f"Unknown task: {task_id}")
-        task.retry_count = 0
-        task.circuit_breaker_tripped = False
-        task.status = TaskStatus.READY
-        task.updated_at = utc_now_iso()
-        self.store.save_task(task)
-        await self.emit_event(
-            "human-team",
-            "circuit_breaker_reset",
-            f"🔓 Circuit breaker reset for `{task.title}`. Task re-queued.",
-        )
-        await self.schedule_ready_tasks()
-        return task
-
-    async def ask_project_question(
-        self,
-        question: str,
-        preferred_agent_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Main Agent Router uses the Lead Architect LLM to route user messages to the right bot(s), with full workspace read/write & task-spawning power."""
-        q_clean = question.strip()
-        q_lower = q_clean.lower()
-        agents = self.store.list_agents()
-        tasks = self.store.list_tasks()
-        project = self.store.get_project()
-
-        selected_agent: Optional[AgentNode] = None
-        routing_reason = ""
-        matched_domain = "Project Engineering & Workspace"
-
-        # 1. Explicit agent selection override
-        if preferred_agent_id and preferred_agent_id != "auto":
-            selected_agent = next((a for a in agents if a.id == preferred_agent_id), None)
-            if selected_agent:
-                routing_reason = f"Explicitly targeted node [{selected_agent.machine_name}] ({selected_agent.display_name})."
-                matched_domain = f"Direct Node ({selected_agent.machine_name})"
-
-        # 2. Direct node/model mention in prompt
-        if not selected_agent:
-            for a in agents:
-                if (
-                    a.machine_name.lower() in q_lower
-                    or a.owner_name.lower() in q_lower
-                    or a.provider.lower() in q_lower
-                    or ("codex" in q_lower and "codex" in a.profile_key.lower())
-                    or ("gemini" in q_lower and "gemini" in a.profile_key.lower())
-                    or ("claude" in q_lower and "claude" in a.profile_key.lower())
-                ):
-                    selected_agent = a
-                    routing_reason = (
-                        f"Message directly references `{a.machine_name}` ({a.display_name}, Tier {a.tier})."
-                    )
-                    matched_domain = f"Node-Specific ({a.machine_name})"
-                    break
-
-        # 3. Dynamic Task & File Ownership matching
-        if not selected_agent:
-            for t in tasks:
-                task_terms = [w.lower() for w in t.title.replace("(", " ").replace(")", " ").replace("/", " ").split() if len(w) > 3]
-                file_terms = [f.lower() for f in t.target_files] + [Path(f).name.lower() for f in t.target_files]
-                if any(term in q_lower for term in file_terms + task_terms):
-                    matched_domain = f"{t.title} ({', '.join(t.target_files)})"
-                    if t.assigned_agent_id:
-                        selected_agent = next((a for a in agents if a.id == t.assigned_agent_id), None)
-                    if selected_agent:
-                        routing_reason = (
-                            f"Matched task `{t.id}` ({matched_domain}) -> Routed to task owner [{selected_agent.machine_name}] ({selected_agent.display_name})."
-                        )
-                        break
-
-        # 4. Route to Project's chosen Lead Architect node (or top Tier-1 node)
-        if not selected_agent and project and project.lead_architect_agent_id:
-            selected_agent = next((a for a in agents if a.id == project.lead_architect_agent_id), None)
-            if selected_agent:
-                routing_reason = (
-                    f"Routed by Main Agent to Project Lead Architect [{selected_agent.machine_name}] ({selected_agent.display_name})."
-                )
-
-        if not selected_agent and agents:
-            selected_agent = sorted(agents, key=lambda a: (a.tier, a.used_pct))[0]
-            routing_reason = (
-                f"Routed by Main Agent to Lead Node [{selected_agent.machine_name}] ({selected_agent.display_name}, Tier {selected_agent.tier})."
-            )
-
-        agent_label = (
-            f"[{selected_agent.machine_name}] {selected_agent.display_name} (Tier {selected_agent.tier})"
-            if selected_agent
-            else "[LEAD_ARCHITECT] Host Orchestrator"
-        )
-        agent_id = selected_agent.id if selected_agent else "host-orchestrator"
-        agent_codename = selected_agent.machine_name if selected_agent else "architect"
-
-        owned_tasks = [t for t in tasks if selected_agent and t.assigned_agent_id == selected_agent.id]
-        owned_summary = (
-            ", ".join(f"`{t.id}` ({t.title} | status={t.status.value} | files={', '.join(t.target_files)})" for t in owned_tasks)
-            if owned_tasks
-            else "Lead Architect & Cross-Module Coordinator"
-        )
-        all_tasks_summary = "\n".join(
-            f"- {t.id} (Phase {t.phase}): {t.title} [status={t.status.value}, agent={t.assigned_agent_id}, files={', '.join(t.target_files)}]"
-            for t in tasks
-        )
-        ws_dir = Path(project.workspace_path) if project else self.git.workspace_dir
-        ws_dir.mkdir(parents=True, exist_ok=True)
-
-        file_snippets: List[str] = []
-        clean_file_list: List[str] = []
-        excluded_dirs = {".git", ".funguys", ".graphify", "__pycache__", "node_modules", ".venv", ".pytest_cache", ".ruff_cache"}
-        for p in sorted(ws_dir.rglob("*")):
-            rel_parts = p.relative_to(ws_dir).parts
-            if p.is_file() and not any(part in excluded_dirs for part in rel_parts):
-                rel_str = p.relative_to(ws_dir).as_posix()
-                clean_file_list.append(rel_str)
-                if len(file_snippets) < 6 and p.stat().st_size < 40_000:
-                    try:
-                        content = p.read_text(encoding="utf-8", errors="ignore")
-                        file_snippets.append(f"--- FILE: {rel_str} ---\n{content[:700]}")
-                    except Exception:
-                        pass
-
-        workspace_context = (
-            f"Project Source Files ({len(clean_file_list)}): {', '.join(clean_file_list)}\n\n"
-            + ("\n\n".join(file_snippets) if file_snippets else "(Workspace is currently empty)")
-        )
-        recent_chat_ctx = "\n".join(
-            f"User: {str(c.get('question', ''))[:400]}\n{c.get('agent_codename', 'agent')}: {str(c.get('answer', ''))[:400]}"
-            for c in self.chat_history[-3:]
-        )
-        q_for_prompt = q_clean if len(q_clean) <= 1800 else (q_clean[:600] + "\n...[truncated stack trace]...\n" + q_clean[-1200:])
-        wants_code_edit = any(
-            kw in q_lower
-            for kw in [
-                "create ", "write ", "modify ", "replace ", "refactor ", "implement ", "add a file", "edit ",
-                "fix ", "move ", "update ", "check my running app", "check running app", "check the app", "test "
-            ]
-        )
-
-        llm_prompt = (
-            f"You are AI node '{agent_codename}' ({agent_label}) inside the FunGuys Multi-AI engineering platform.\n"
-            f"Active Project: {project.name if project else 'Untitled'} — {project.description if project else ''}\n"
-            f"Workspace Root: {ws_dir}\n"
-            f"Your Role / Owned Tasks: {owned_summary}\n"
-            f"All Project Tasks in DAG:\n{all_tasks_summary}\n\n"
-            f"Current Workspace Context:\n{workspace_context}\n\n"
-            f"Recent Conversation:\n{recent_chat_ctx}\n\n"
-            f"User Message: {q_for_prompt}\n\n"
-            f"Instructions:\n"
-            f"1. You have FULL read, write, and command execution access to the project workspace `{ws_dir}`.\n"
-            f"2. You CAN and SHOULD inspect workspace files, run diagnostic checks (e.g. check adb devices, inspect running app processes, test code), and edit/create code files whenever the user asks you to check, fix, or run something.\n"
-            f"3. Talk naturally and conversationally to the user as `{agent_codename}`. Explain clearly what you inspected or fixed, and provide clear actionable instructions or results."
-        )
-
-        def _call_actionable_agent() -> Optional[str]:
-            import os
-            import shutil
-            import subprocess
-            import tempfile
-
-            codex_bin = shutil.which("codex") or r"C:\Users\USER\AppData\Local\Programs\OpenAI\Codex\bin\codex.EXE"
-            if not os.path.exists(codex_bin):
-                return None
-            out_file = os.path.join(tempfile.gettempdir(), f"funguys_chat_{uuid.uuid4().hex[:6]}.txt")
-            exec_dir = str(ws_dir)
-            try:
-                subprocess.run(
-                    [
-                        codex_bin,
-                        "exec",
-                        "-C",
-                        exec_dir,
-                        "--skip-git-repo-check",
-                        "--dangerously-bypass-approvals-and-sandbox",
-                        "--ephemeral",
-                        "-o",
-                        out_file,
-                        llm_prompt,
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                if os.path.exists(out_file):
-                    text = Path(out_file).read_text(encoding="utf-8", errors="ignore").strip()
-                    try:
-                        os.remove(out_file)
-                    except Exception:
-                        pass
-                    if text:
-                        return text
-            except Exception:
-                pass
-            return None
-
-        import asyncio
-
-        llm_reply = await asyncio.to_thread(_call_actionable_agent)
-        if wants_code_edit:
-            self.graph.build_graph()
-
-        if not llm_reply:
-            completed_tasks = [t for t in tasks if t.status == TaskStatus.COMPLETED]
-            in_prog_tasks = [t for t in tasks if t.status == TaskStatus.IN_PROGRESS]
-            status_line = (
-                f"All {len(tasks)} phases are **COMPLETED**!"
-                if tasks and len(completed_tasks) == len(tasks)
-                else f"**{len(completed_tasks)}/{len(tasks)} phases completed** ({', '.join(t.id for t in in_prog_tasks) or 'idle'} currently active)."
-            )
-            llm_reply = (
-                f"Hey! Here is the current status from **{agent_codename}**:\n"
-                f"- **Build Progress:** {status_line}\n"
-                f"- **Phase Breakdown:** " + "; ".join(f"Phase {t.phase} (`{t.id}`): **{t.status.value.upper()}**" for t in tasks) + "\n"
-                f"- **Project Source Files (`{ws_dir}`):** `{', '.join(clean_file_list) if clean_file_list else 'None'}`\n"
-                f"- **How to Run Tests / App:** First `cd \"{ws_dir}\"`, then run `.\\.venv\\Scripts\\python.exe -m pytest -q` or `.\\.venv\\Scripts\\python.exe run_app.py`."
-            )
-
-        entry = {
-            "id": f"msg-{uuid.uuid4().hex[:8]}",
-            "timestamp": utc_now_iso(),
-            "question": q_clean,
-            "matched_domain": matched_domain,
-            "routing_reason": routing_reason,
-            "agent_id": agent_id,
-            "agent_codename": agent_codename,
-            "agent_label": agent_label,
-            "answer": llm_reply,
-        }
-        self.chat_history.append(entry)
-        await self.emit_event(
-            "main-router",
-            "query_routed",
-            f"🧭 **Main Router:** Routed message *\"{q_clean[:60]}\"* -> **{agent_codename}** ({matched_domain})",
-            metadata={"agent_id": agent_id, "domain": matched_domain},
-        )
-        await self.emit_event(
-            agent_id,
-            "agent_responded",
-            f"💬 **{agent_codename}** responded (and synced workspace `{ws_dir.name}`).",
-            metadata={"chat_id": entry["id"]},
-        )
-        return entry
-
-
-
+    async def ask_project_question(self, question, preferred_agent_id=None):
+        from funguys.worker.adapters import run_text_agent
+        async with self._state_lock:
+            if self._planning:
+                raise ConflictError('Architect consultation is already in progress')
+            agents = self.store.list_agents()
+            selected = next((a for a in agents if a.id == preferred_agent_id),None) if preferred_agent_id and preferred_agent_id != 'auto' else None
+            if preferred_agent_id and preferred_agent_id != 'auto' and not selected:
+                raise ValueError('Selected agent does not exist')
+            if not selected:
+                selected = min((a for a in agents if a.executor == 'local' and a.status == AgentStatus.IDLE and a.id not in self._consulting_agents),key=lambda a:a.tier,default=None)
+            if not selected or selected.executor != 'local':
+                raise ConflictError('Interactive chat requires an idle local agent. Remote workers accept coding tasks only; no different provider was substituted.')
+            if selected.status != AgentStatus.IDLE or selected.id in self._consulting_agents or selected.used_pct >= selected.soft_limit_pct:
+                raise ConflictError('Selected agent is busy or unavailable')
+            self._consulting_agents.add(selected.id)
+            selected.status = AgentStatus.WORKING
+            self.store.save_agent(selected)
+            project = self.store.get_project()
+        try:
+            files = await asyncio.to_thread(bundle,self.git.workspace_path)
+            context = '\n'.join(f'FILE {name}\n{content[:2500]}' for name,content in list(files['files'].items())[:12])
+            prompt = f'Answer this question using the supplied context. Do not call tools or edit files. Project: {project.name}\nContracts: {project.contracts_markdown}\n{context}\nQuestion: {question}'
+            answer = await asyncio.to_thread(run_text_agent,selected.provider,prompt)
+            entry = {'id':'msg-'+uuid.uuid4().hex,'project_id':project.id,'timestamp':utc_now_iso(),'question':question,'answer':answer,'agent_id':selected.id,'agent_codename':selected.machine_name,'agent_label':selected.display_name,'routing_reason':'Executed by the selected local provider','matched_domain':'Project context'}
+            self.store.save_chat(entry)
+            self.chat_history = self.store.list_chat()
+            return entry
+        finally:
+            async with self._state_lock:
+                self._consulting_agents.discard(selected.id)
+                agent = self.store.get_agent(selected.id)
+                if agent and not agent.current_task_id:
+                    agent.status = AgentStatus.COOLDOWN if agent.cooldown_until else AgentStatus.IDLE
+                    self.store.save_agent(agent)
