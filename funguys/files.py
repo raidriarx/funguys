@@ -7,10 +7,10 @@ import unicodedata
 from pathlib import Path, PureWindowsPath
 
 EXCLUDED = {'.git', '.funguys', '.graphify', '.venv', 'venv', 'env', 'node_modules',
-            '__pycache__', '.pytest_cache', '.ruff_cache', 'dist', 'build', '.aws', '.ssh', '.codex', '.agents'}
+            '__pycache__', '.pytest_cache', '.ruff_cache', '.cache', 'dist', 'build', '.aws', '.ssh', '.codex', '.agents'}
 SECRET_NAMES = {'.env', '.netrc', '.npmrc', '.pypirc', 'credentials', 'credentials.json', 'id_rsa', 'id_ed25519'}
-MAX_FILE = 2_000_000
-MAX_BUNDLE = 20_000_000
+MAX_FILE = 15_000_000
+MAX_BUNDLE = 60_000_000
 MAX_FILES = 2000
 
 

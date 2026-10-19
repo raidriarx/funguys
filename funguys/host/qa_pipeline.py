@@ -113,12 +113,36 @@ class AutonomousQAPipeline:
         return not errors, '\n'.join(errors) if errors else f'Parsed {count} Python files; checked JSON and required targets'
 
     def _execute(self, argv, timeout=90):
-        if self.runner.trusted and argv[0] in ('python', 'python3'):
-            argv = [sys.executable, *argv[1:]]
-        return self.runner.run(argv, timeout)
+        if self.runner.trusted:
+            if argv[0] in ('python', 'python3'):
+                argv = [sys.executable, *argv[1:]]
+            else:
+                import shutil
+                target = Path(self.workspace_path) / argv[0]
+                if target.is_file():
+                    resolved = str(target.resolve())
+                else:
+                    resolved = shutil.which(argv[0])
+                if not resolved:
+                    raise EnvironmentUnavailable(f'Verification tool not found on host PATH or workspace: {argv[0]}')
+                argv = [resolved, *argv[1:]]
+        try:
+            return self.runner.run(argv, timeout)
+        except FileNotFoundError as exc:
+            raise EnvironmentUnavailable(f'Verification tool not found: {argv[0]}') from exc
 
     def _run_unit_tests(self, task):
-        commands = [shlex.split(cmd, posix=True) for cmd in task.verification_commands if cmd.strip()]
+        commands = []
+        for cmd in task.verification_commands:
+            c = cmd.strip()
+            if not c:
+                continue
+            # Strip PowerShell call operator & prefix and quotes around binary if present
+            if c.startswith('& '):
+                c = c[2:].strip()
+            parts = shlex.split(c, posix=(os.name != 'nt'))
+            if parts:
+                commands.append(parts)
         for path in source_files(self.workspace_path):
             if path.suffix in ('.js','.mjs','.cjs'):
                 commands.append(['node','--check',path.relative_to(self.workspace_path).as_posix()])

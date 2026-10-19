@@ -19,6 +19,10 @@ class ConflictError(ValueError):
 class FunGuysOrchestrator:
     def __init__(self, store, default_workspace, broadcast_cb=None):
         self.store, self.default_workspace, self.broadcast_cb = store, default_workspace, broadcast_cb
+        from funguys.host.workflow_log import WorkflowLogger
+        db_path = getattr(store, 'db_path', None)
+        self.wlog = WorkflowLogger(Path(db_path).parent / 'logs' if db_path else None)
+        self.wlog.log('host_start', 'Orchestrator started', default_workspace=str(default_workspace))
         self._state_lock = asyncio.Lock()
         self._submission_lock = asyncio.Lock()
         self._local_running = set()
@@ -64,6 +68,7 @@ class FunGuysOrchestrator:
     async def emit_event(self, source, event_type, message, metadata=None):
         evt = ActivityEvent(id='evt-' + uuid.uuid4().hex, source=source, event_type=event_type, message=message, metadata=metadata or {})
         self.store.add_event(evt)
+        self.wlog.log('event:' + event_type, message, source=source, metadata=metadata or {})
         if self.broadcast_cb:
             await self.broadcast_cb({'type': 'event', 'event': evt.model_dump()})
         return evt
@@ -107,6 +112,7 @@ class FunGuysOrchestrator:
                 task.assignment_id = task.assigned_agent_id = task.candidate_path = task.candidate_revision = None
             self.store.replace_tasks(tasks, project)
             self._release_agents()
+        self.wlog.log('plan_installed', f'{len(tasks)} task(s) installed', project_id=project.id, plan_version=project.plan_version, contracts_markdown=contracts, tasks=[t.model_dump(include={'id','title','phase','complexity_tier','dependencies','target_files','verification_commands','require_tests','require_browser','status'}) for t in tasks])
         await self.emit_event('planner', 'plan_drafted', 'Plan compiled. Review contracts and explicitly approve this plan version.')
         return project
 
@@ -242,7 +248,10 @@ class FunGuysOrchestrator:
                     continue
                 agent = self.select_best_agent_for_task(task,available)
                 if not agent:
-                    task.blocked_reason = 'Waiting for a connected worker with sufficient quota and the required tier'
+                    reason = 'Waiting for a connected worker with sufficient quota and the required tier'
+                    if task.blocked_reason != reason:
+                        self.wlog.log('schedule_waiting', reason, task_id=task.id, complexity_tier=task.complexity_tier, agents=[{'id':a.id,'status':a.status.value,'tier':a.tier,'used_pct':a.used_pct,'executor':a.executor} for a in available])
+                    task.blocked_reason = reason
                     self.store.save_task(task)
                     continue
                 assignment_id = uuid.uuid4().hex
@@ -252,6 +261,7 @@ class FunGuysOrchestrator:
                     await asyncio.to_thread(self.git.integrate_latest, candidate)
                     base = await asyncio.to_thread(self.git.git, 'rev-parse', 'HEAD', cwd=candidate)
                 except (ValueError, RuntimeError) as exc:
+                    self.wlog.exception('assignment_prepare_failed', 'Could not prepare candidate worktree', exc, task_id=task.id)
                     task.status, task.blocked_reason = TaskStatus.BLOCKED_ENVIRONMENT, str(exc)
                     self.store.save_task(task)
                     continue
@@ -409,8 +419,10 @@ class FunGuysOrchestrator:
                     current.candidate_revision = task.candidate_revision
                     self.store.save_task(current)
                 qa = AutonomousQAPipeline(candidate)
+                self.wlog.log('qa_started', f'Verifying {task_id}', task_id=task_id, agent_id=agent_id, human=human, changed_files=sorted(decoded), deleted_files=deleted_files, verify_only=_verify_only)
                 report = await qa.verify_task(task, project.live_preview_url)
             except Exception as exc:
+                self.wlog.exception('submission_failed', f'Submission/QA crashed for {task_id}', exc, task_id=task_id, agent_id=agent_id)
                 async with self._state_lock:
                     current = self.store.get_task(task_id)
                     if current and current.assignment_id == assignment_id:
@@ -424,6 +436,7 @@ class FunGuysOrchestrator:
                 raise
             report.project_id,report.plan_version = project_id,plan_version
             self.store.save_qa_report(report)
+            self.wlog.log('qa_report', f'{task_id}: passed={report.overall_passed}', task_id=task_id, attempt=report.attempt, checks=report.checks, environment_blocked=report.environment_blocked, logs=report.logs)
             if report.screenshot_path:
                 import shutil
                 origin = qa.screenshots_dir / Path(report.screenshot_path).name
@@ -463,6 +476,7 @@ class FunGuysOrchestrator:
                 task.updated_at = utc_now_iso()
                 task.submission_status = task.status.value
                 self.store.save_task(task)
+                self.wlog.log('task_outcome', f'{task.id} -> {task.status.value}', task_id=task.id, status=task.status.value, retry_count=task.retry_count, complexity_tier=task.complexity_tier, blocked_reason=task.blocked_reason)
             if task.status == TaskStatus.COMPLETED:
                 try:
                     _, alerts = await asyncio.to_thread(self.graph.scan_and_detect_contract_deltas, task.id, agent_id or 'human', self.store.list_tasks())
@@ -543,6 +557,7 @@ class FunGuysOrchestrator:
                 raise ConflictError('Stale execution failure')
             task.execution_failures += 1
             task.last_error = error[:10000]
+            self.wlog.log('execution_failed', f'{task_id} execution failed', task_id=task_id, agent_id=agent_id, error=error)
             task.status, task.blocked_reason = TaskStatus.BLOCKED_ENVIRONMENT, 'Execution failed; fix the worker environment and explicitly reset this task'
             task.assignment_id = None
             self._finish_agent(task)
@@ -652,6 +667,7 @@ class FunGuysOrchestrator:
                         await asyncio.to_thread(write_snapshot, Path(scratch), snapshot)
                         prompt = build_graphify_task_prompt(payload['task'], payload['contracts_markdown'], payload['subgraph_digest'])
                         ok, limited, _, output = await asyncio.to_thread(run_cli_agent_task, agent.provider, Path(scratch), prompt, task.target_files, 240, cancelled)
+                        self.wlog.log('local_cli_finished', f'{agent.provider} finished {task.id}', task_id=task.id, agent_id=agent.id, ok=ok, rate_limited=limited, prompt=prompt, output=output)
                         fresh = self.store.get_task(task.id)
                         if not fresh or fresh.assignment_id != task.assignment_id or fresh.status != TaskStatus.IN_PROGRESS:
                             continue

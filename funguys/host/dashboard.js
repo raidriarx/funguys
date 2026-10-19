@@ -6,8 +6,19 @@ let state, socket, reconnectTimer, pollTimer, signedIn = false, retries = 0, bus
 let contractsDirty = false, reviewedVersion = null;
 let lastStateSequence = -1;
 let hostInstance = null;
+let activeScreen = 'project';
+
 const el = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
 function error(message) { $('error').textContent = message || ''; $('error').hidden = !message; }
+
+function setScreen(name) {
+  activeScreen = name;
+  if ($('screen-project')) $('screen-project').hidden = (name !== 'project');
+  if ($('screen-workers')) $('screen-workers').hidden = (name !== 'workers');
+  if ($('nav-btn-project')) $('nav-btn-project').className = 'tab-btn' + (name === 'project' ? ' active' : '');
+  if ($('nav-btn-workers')) $('nav-btn-workers').className = 'tab-btn' + (name === 'workers' ? ' active' : '');
+}
+
 function showLogin() {
   signedIn = false;
   $('login').hidden = false; $('app').hidden = true; $('sign-out').hidden = true;
@@ -29,11 +40,13 @@ async function action(fn) {
   catch (err) { error(err.message || String(err)); }
   finally { busy--; $('busy').hidden = busy === 0; }
 }
-function bind(id, fn, form = false) { $(id).addEventListener(form ? 'submit' : 'click', evt => { evt.preventDefault(); action(fn); }); }
+function bind(id, fn, form = false) { const node = $(id); if (node) node.addEventListener(form ? 'submit' : 'click', evt => { evt.preventDefault(); action(fn); }); }
 function button(text, fn) { const node = el('button',text); node.type='button'; node.addEventListener('click', () => action(fn)); return node; }
 function card(title, detail) { const node=el('div',undefined,'card'); node.append(el('h3',title)); if (detail) node.append(el('p',detail,'muted')); return node; }
 function fillSelect(id, options, fallback) {
-  const node = $(id), previous = node.value;
+  const node = $(id);
+  if (!node) return;
+  const previous = node.value;
   node.replaceChildren(...options.map(([value,label]) => { const o=el('option',label); o.value=value; return o; }));
   if (options.some(([value]) => value===previous)) node.value=previous;
   else if (fallback) node.value=fallback;
@@ -77,6 +90,42 @@ function render(data) {
   if (!contractsDirty) { $('contracts').value=project.contracts_markdown || ''; reviewedVersion=project.plan_version; }
   else if (reviewedVersion!==project.plan_version) error('The server plan changed while you were editing. Your draft is preserved. Refresh and explicitly discard the draft to review the new plan.');
   $('contract-dirty').hidden=!contractsDirty;
+
+  const workerCount = data.agents.length;
+  if ($('nav-worker-count')) $('nav-worker-count').textContent = String(workerCount);
+  if ($('worker-summary-count')) $('worker-summary-count').textContent = String(workerCount);
+
+  // Position invite worker section:
+  // If no worker nodes exist, place the invite interface at the top of the project screen so it is seen first.
+  // Otherwise, place it inside the dedicated workers screen.
+  const inviteColumns = $('invite-columns');
+  const zeroWorkersContainer = $('zero-workers-container');
+  const workersContainer = $('workers-container');
+  if (inviteColumns && zeroWorkersContainer && workersContainer) {
+    if (workerCount === 0) {
+      if (inviteColumns.parentElement !== zeroWorkersContainer) {
+        zeroWorkersContainer.replaceChildren(inviteColumns);
+      }
+      zeroWorkersContainer.hidden = false;
+    } else {
+      zeroWorkersContainer.hidden = true;
+      if (inviteColumns.parentElement !== workersContainer) {
+        workersContainer.replaceChildren(inviteColumns);
+      }
+    }
+  }
+
+  const targets = [];
+  const localHost = location.hostname || 'localhost';
+  const port = location.port ? `:${location.port}` : '';
+  targets.push([`${location.protocol}//${localHost}${port}`, `This Computer (Localhost - ${localHost})`]);
+  if (data.lan_ip && data.lan_ip !== '127.0.0.1' && data.lan_ip !== localHost) {
+    targets.push([`http://${data.lan_ip}:${location.port || 8420}`, `Same Wi-Fi / Local Network (${data.lan_ip})`]);
+  }
+  if (data.public_url) {
+    targets.push([data.public_url, `Public Internet (Cloudflare Tunnel)`]);
+  }
+  fillSelect('invite-target', targets, targets[0][0]);
   const profiles=Object.entries(data.profiles).filter(([,p]) => p.provider!=='api').map(([key,p]) => [key,`${p.display_name} · Tier ${p.tier}`]);
   fillSelect('invite-profile',profiles,'codex-pro'); fillSelect('local-profile',profiles,'codex-pro');
   const locals=data.agents.filter(a => a.executor==='local').map(a => [a.id,`${a.machine_name} · ${a.display_name} · ${a.status}`]);
@@ -113,6 +162,64 @@ function download(name,data) {
   const link=el('a'); link.href=url; link.download=name; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
 }
 function renderTasks(tasks) {
+  // Spotlight for what is currently being worked on:
+  const spotlight = $('active-spotlight');
+  if (spotlight) {
+    const activeTasks = tasks.filter(t => ['in_progress','in_qa','blocked_environment','blocked_circuit_breaker'].includes(t.status));
+    if (activeTasks.length > 0) {
+      spotlight.replaceChildren(...activeTasks.map(task => {
+        const isBlocked = task.status.startsWith('blocked_');
+        const isQa = task.status === 'in_qa';
+        const cardClass = isBlocked ? 'spotlight-card blocked' : (isQa ? 'spotlight-card qa' : 'spotlight-card');
+        const tagText = isBlocked ? '⚠️ BLOCKED — NEEDS ATTENTION' : (isQa ? '🔍 IN QA VERIFICATION' : '⚡ CURRENTLY WORKING ON');
+        const tagClass = isBlocked ? 'warn' : 'good';
+        
+        const node = el('div', undefined, cardClass);
+        node.append(el('span', tagText, `spotlight-tag ${tagClass}`));
+        node.append(el('h3', `${task.id} · ${task.title}`));
+        
+        const agent = state.agents.find(a => a.id === task.assigned_agent_id);
+        const ownerName = task.assigned_human ? `Human teammate: ${task.assigned_human}` : (agent ? `${agent.machine_name} (${agent.display_name})` : 'Awaiting worker assignment');
+        node.append(el('p', `Status: ${task.status.toUpperCase()} · Assigned to: ${ownerName} · Phase ${task.phase} · QA retries: ${task.retry_count}/${task.max_retries}`));
+        node.append(el('p', task.description));
+        node.append(el('p', `Target files: ${task.target_files.join(', ')}`, 'muted'));
+        
+        if (task.blocked_reason) node.append(el('pre', task.blocked_reason, 'warn'));
+        if (task.last_error) {
+          const details = el('details');
+          details.append(el('summary', 'Last failure details'), el('pre', task.last_error));
+          node.append(details);
+        }
+        
+        const row = el('div', undefined, 'row');
+        if (['blocked_environment','blocked_circuit_breaker'].includes(task.status)) {
+          row.append(button('Reset after review', async () => { await api(`/api/tasks/${task.id}/reset-circuit-breaker`,{}); await refresh(); }));
+        }
+        if (task.status === 'blocked_environment' && task.candidate_revision) {
+          row.append(button('Recheck retained code in QA', async () => { await api(`/api/tasks/${task.id}/retry-qa`,{}); await refresh(); }));
+        }
+        if (!['completed','in_qa'].includes(task.status) && state.project.plan_approved) {
+          row.append(button(task.assigned_human ? 'Prepare human retry' : 'Claim as human', async () => {
+            const human_name = prompt('Human teammate name', task.assigned_human || 'Host');
+            if (!human_name) return;
+            await api(`/api/tasks/${task.id}/claim-human`, {human_name});
+            await refresh();
+          }));
+        }
+        if (task.assigned_human && task.status !== 'in_qa') {
+          row.append(button('Release to workers', async () => { await api(`/api/tasks/${task.id}/release-human`, {}); await refresh(); }));
+        }
+        if (row.children.length > 0) node.append(row);
+        return node;
+      }));
+      spotlight.hidden = false;
+    } else {
+      spotlight.replaceChildren();
+      spotlight.hidden = true;
+    }
+  }
+
+  // Full Task List
   $('tasks').replaceChildren(...tasks.map(task => {
     const agent=state.agents.find(a => a.id===task.assigned_agent_id);
     const node=card(`${task.id} · ${task.title}`,`Phase ${task.phase} · Tier ${task.complexity_tier} · ${task.status} · QA retries ${task.retry_count}/${task.max_retries}`);
@@ -157,6 +264,18 @@ function renderReports(reports) {
 async function answer(value) { await api('/api/grill/answer',{answer:value}); $('grill-answer').value=''; await refresh(); }
 bind('login-form',async () => { await api('/api/session',{token:$('login-token').value}); $('login-token').value=''; await start(); },true);
 bind('sign-out',async () => { await api('/api/session',undefined,'DELETE'); showLogin(); });
+bind('restart-host',async () => {
+  if (!confirm('Restart the Host server process to apply new code and refresh tunnels?')) return;
+  try { await api('/api/host/restart',{}); } catch (_) {}
+  $('connection').textContent = 'RESTARTING...';
+  $('connection').className = 'warn';
+  setTimeout(() => location.reload(), 3000);
+});
+bind('nav-btn-project', () => setScreen('project'));
+bind('nav-btn-workers', () => setScreen('workers'));
+bind('btn-back-to-project', () => setScreen('project'));
+if ($('project-workers-badge')) $('project-workers-badge').addEventListener('click', () => setScreen('workers'));
+
 $('contracts').addEventListener('input',() => { contractsDirty=true; $('contract-dirty').hidden=false; });
 bind('refresh',async () => { if (contractsDirty && !confirm('Discard unsaved contract edits and reload the server plan?')) return; contractsDirty=false; await refresh(); });
 bind('approve',async () => {
@@ -174,9 +293,10 @@ bind('local-form',async () => {
   await api('/api/agents/register',{owner_name:$('local-name').value,machine_name:'host-'+profile,profile_key:profile,worker_id,executor:'local'}); await refresh();
 },true);
 bind('invite-form',async () => {
-  if (!state.public_url && ['127.0.0.1','localhost','::1'].includes(state.listen_host)) throw new Error('The host is bound to loopback. Restart with --tunnel or --host 0.0.0.0 before inviting a remote worker.');
+  const chosenBase = $('invite-target').value;
+  if (!chosenBase && !state.public_url && ['127.0.0.1','localhost','::1'].includes(state.listen_host)) throw new Error('The host is bound to loopback. Restart with --tunnel or --host 0.0.0.0 before inviting a remote worker.');
   const invite=await api('/api/invites',{});
-  const base=state.public_url || (['localhost','127.0.0.1'].includes(location.hostname) && state.lan_ip && state.lan_ip!=='127.0.0.1' ? `${location.protocol}//${state.lan_ip}:${location.port || 8420}` : location.origin);
+  const base = chosenBase || state.public_url || location.origin;
   const query=new URLSearchParams({token:invite.token,name:$('invite-name').value,codename:$('invite-code').value,profile:$('invite-profile').value});
   $('win-command').value=`irm "${base}/join.ps1?${query}" | iex`;
   $('bash-command').value=`curl --fail -sSL "${base}/join.sh?${query}" | bash`;

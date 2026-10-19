@@ -22,9 +22,9 @@ from collections import deque
 from pathlib import Path, PureWindowsPath
 
 EXCLUDED = {'.git', '.funguys', '.graphify', '.venv', 'venv', 'env', 'node_modules', '__pycache__',
-            '.pytest_cache', '.ruff_cache', 'dist', 'build', '.aws', '.ssh', '.codex', '.agents'}
+            '.pytest_cache', '.ruff_cache', '.cache', 'dist', 'build', '.aws', '.ssh', '.codex', '.agents'}
 SECRETS = {'.env', '.netrc', '.npmrc', '.pypirc', 'credentials', 'credentials.json', 'id_rsa', 'id_ed25519'}
-MAX_FILE, MAX_BUNDLE, MAX_FILES = 2_000_000, 20_000_000, 2000
+MAX_FILE, MAX_BUNDLE, MAX_FILES = 15_000_000, 60_000_000, 2000
 
 
 def private(parts):
@@ -260,7 +260,7 @@ class WorkerRuntime:
         self.assignment = assignment
         self.cancelled.clear()
         snapshot = self.request('GET', '/api/workspace/snapshot?' + urllib.parse.urlencode({'task_id': task['id'], 'assignment_id': task['assignment_id']}))
-        with tempfile.TemporaryDirectory(prefix='funguys-worker-') as scratch:
+        with tempfile.TemporaryDirectory(prefix='funguys-worker-', ignore_cleanup_errors=True) as scratch:
             root = Path(scratch)
             write_snapshot(root, snapshot)
             try:

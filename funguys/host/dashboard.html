@@ -4,24 +4,233 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FunGuys // Mission Control</title>
 <style>
-:root{color-scheme:dark;font-family:ui-monospace,Consolas,monospace;background:#080808;color:#eee;font-size:13px}*{box-sizing:border-box}body{margin:0}header,main,#login{max-width:1440px;margin:auto;padding:24px}header{border-bottom:1px solid #666;display:flex;justify-content:space-between;gap:16px;align-items:center}h1{font-size:25px;margin:0}h2{font-size:15px;text-transform:uppercase;margin:0 0 16px;letter-spacing:1px}h3{font-size:14px;margin:0 0 8px}p{line-height:1.6}.muted,small{color:#aaa}.good{color:#8de0ac}.bad{color:#ff9d9d}.warn{color:#f6d18b}section{border:1px solid #666;padding:20px;margin-bottom:20px;background:#0d0d0d}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.columns>section{min-width:0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}label{display:block;margin:12px 0 6px}input,select,textarea,button{font:inherit;border:1px solid #777;background:#111;color:#eee;padding:9px}input,select,textarea{max-width:100%}input,textarea{width:100%}textarea{min-height:110px;resize:vertical;line-height:1.5}button{cursor:pointer}button:hover{background:#eee;color:#111}button:disabled{opacity:.4;cursor:default}button.primary{background:#eee;color:#080808;font-weight:bold}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0;line-height:1.5;max-height:500px;overflow:auto}.card{border:1px solid #555;padding:14px;margin:12px 0}.status{font-size:11px;letter-spacing:.6px;border:1px solid #999;padding:3px 6px}.card .row{margin-top:12px}.notice{position:sticky;top:0;background:#211716;padding:12px 24px;z-index:4;border-bottom:1px solid #b77;white-space:pre-wrap;overflow-wrap:anywhere}#login{max-width:620px}.commands{font-size:11px;min-height:64px}details{margin-top:14px}summary{cursor:pointer}a{color:#afcdfa}form{margin:0}#connection{white-space:nowrap}#project-label{margin:8px 0}#contract-dirty{margin:10px 0;color:#f6d18b}[hidden]{display:none!important}#busy{position:fixed;bottom:14px;right:14px;background:#eee;color:#000;padding:10px;z-index:5}@media(max-width:800px){.columns{grid-template-columns:1fr}header{align-items:flex-start}header,main{padding:14px}h1{font-size:20px}}
+:root{color-scheme:dark;font-family:ui-monospace,Consolas,monospace;background:#080808;color:#eee;font-size:13px}*{box-sizing:border-box}body{margin:0}header,main,#login{max-width:1440px;margin:auto;padding:24px}header{border-bottom:1px solid #666;display:flex;justify-content:space-between;gap:16px;align-items:center}h1{font-size:25px;margin:0}h2{font-size:15px;text-transform:uppercase;margin:0 0 16px;letter-spacing:1px}h3{font-size:14px;margin:0 0 8px}p{line-height:1.6}.muted,small{color:#aaa}.good{color:#8de0ac}.bad{color:#ff9d9d}.warn{color:#f6d18b}section{border:1px solid #666;padding:20px;margin-bottom:20px;background:#0d0d0d}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.columns>section{min-width:0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}label{display:block;margin:12px 0 6px}input,select,textarea,button{font:inherit;border:1px solid #777;background:#111;color:#eee;padding:9px}input,select,textarea{max-width:100%}input,textarea{width:100%}textarea{min-height:110px;resize:vertical;line-height:1.5}button{cursor:pointer}button:hover{background:#eee;color:#111}button:disabled{opacity:.4;cursor:default}button.primary{background:#eee;color:#080808;font-weight:bold}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0;line-height:1.5;max-height:500px;overflow:auto}.card{border:1px solid #555;padding:14px;margin:12px 0}.status{font-size:11px;letter-spacing:.6px;border:1px solid #999;padding:3px 6px}.card .row{margin-top:12px}.notice{position:sticky;top:0;background:#211716;padding:12px 24px;z-index:4;border-bottom:1px solid #b77;white-space:pre-wrap;overflow-wrap:anywhere}#login{max-width:620px}.commands{font-size:11px;min-height:64px}details{margin-top:14px}summary{cursor:pointer}a{color:#afcdfa}form{margin:0}#connection{white-space:nowrap}#project-label{margin:8px 0}#contract-dirty{margin:10px 0;color:#f6d18b}[hidden]{display:none!important}#busy{position:fixed;bottom:14px;right:14px;background:#eee;color:#000;padding:10px;z-index:5}
+.tab-btn{font:inherit;background:#111;color:#aaa;border:1px solid #555;padding:8px 16px;cursor:pointer;font-size:13px;letter-spacing:0.5px}
+.tab-btn:hover{background:#222;color:#fff}
+.tab-btn.active{background:#eee;color:#080808;font-weight:bold;border-color:#eee}
+.spotlight-card{border:2px solid #4a9;background:#0d1c14;padding:16px;margin:12px 0}
+.spotlight-card.blocked{border-color:#f6d18b;background:#1c1708}
+.spotlight-card.qa{border-color:#7cc4fa;background:#0c1824}
+.spotlight-tag{font-size:11px;font-weight:bold;letter-spacing:1px;padding:3px 8px;border:1px solid currentColor;display:inline-block;margin-bottom:8px}
+.badge-btn{cursor:pointer;border:1px solid #777;padding:4px 10px;background:#161616;font-size:11px}
+.badge-btn:hover{background:#2a2a2a;color:#fff}
+@media(max-width:800px){.columns{grid-template-columns:1fr}header{align-items:flex-start}header,main{padding:14px}h1{font-size:20px}}
 </style>
 <script src="/dashboard.js" defer></script>
 </head>
 <body>
-<header><div><h1>FUNGUYS // MISSION CONTROL</h1><p class="muted">Collaborative engineering · reviewed plans · verified changes</p></div><div><span id="connection" class="warn">CONNECTING</span><p><button id="sign-out" hidden>Sign out</button></p></div></header>
+<header><div><h1>FUNGUYS // MISSION CONTROL</h1><p class="muted">Collaborative engineering · reviewed plans · verified changes</p></div><div class="row"><span id="connection" class="warn">CONNECTING</span><button id="restart-host" title="Restart Host Process">Restart Host</button><button id="sign-out" hidden>Sign out</button></div></header>
 <div id="error" class="notice bad" role="alert" hidden></div><div id="busy" role="status" hidden>Working…</div>
 <section id="login"><h2>Administrator sign in</h2><p>Use the token saved in <code>.funguys/admin_token</code> on the host machine. Workers connect through the invitation commands.</p><form id="login-form"><label for="login-token">Administrator token</label><input id="login-token" type="password" required autocomplete="current-password"><p><button class="primary">Sign in</button></p></form></section>
 <main id="app" hidden>
-<section><div class="row"><h2>Project control</h2><span id="project-status" class="status"></span></div><p id="project-label"></p><div class="row"><button id="approve" class="primary">Approve reviewed plan & unlock workers</button><button id="pause">Pause project</button><button id="refresh">Refresh</button><button id="simulate">Run isolated demo</button></div><pre id="simulation" hidden></pre><details><summary>Create or activate a project without an AI interview</summary><form id="project-form"><label for="project-name">Project name</label><input id="project-name" required><label for="project-description">Goal</label><textarea id="project-description"></textarea><label for="project-path">Existing workspace path (optional)</label><input id="project-path" placeholder="Leave blank for a fresh project directory"><p><button>Create / activate project</button></p></form></details></section>
-<div class="columns">
-<section><h2>Worker nodes</h2><div id="agents"></div><details><summary>Register a local host executor</summary><p class="muted">Local execution and planning require the selected CLI and FUNGUYS_TRUSTED_EXECUTION=1. Remote workers run on their own machines.</p><form id="local-form"><label for="local-name">Owner</label><input id="local-name" value="Host" required><label for="local-profile">Subscription profile</label><select id="local-profile"></select><p><button>Register local executor</button></p></form></details></section>
-<section><h2>Invite a worker</h2><p class="muted">Requires Python 3.11+ and the selected AI CLI on the worker. No repository or FunGuys package installation is needed. Invitations expire in one hour and enroll one machine.</p><form id="invite-form"><label for="invite-name">Owner name</label><input id="invite-name" value="Teammate" required><label for="invite-code">Machine code name</label><input id="invite-code" placeholder="Uses the worker's hostname when blank"><label for="invite-profile">Subscription profile</label><select id="invite-profile"></select><p><button>Create invitation</button></p></form><div id="invite-result" hidden><label for="win-command">Windows PowerShell</label><textarea id="win-command" class="commands" readonly></textarea><button data-copy="win-command">Copy Windows command</button><label for="bash-command">Mac / Linux Bash</label><textarea id="bash-command" class="commands" readonly></textarea><button data-copy="bash-command">Copy Bash command</button><p id="invite-expiry" class="muted"></p></div></section>
+<nav id="screen-nav" class="row" style="margin-bottom:16px;gap:8px">
+  <button type="button" id="nav-btn-project" class="tab-btn active">⚡ Project & Tasks</button>
+  <button type="button" id="nav-btn-workers" class="tab-btn">👥 Workers & Invites (<span id="nav-worker-count">0</span>)</button>
+</nav>
+
+<div id="screen-project">
+  <div id="zero-workers-container"></div>
+  <section id="section-project-control">
+    <div class="row">
+      <h2>Project control</h2>
+      <span id="project-status" class="status"></span>
+      <span id="project-workers-badge" class="badge-btn muted" title="Click to view worker nodes and invite screen" style="margin-left:auto">Workers: <span id="worker-summary-count">0</span> connected · Manage / Invite →</span>
+    </div>
+    <p id="project-label"></p>
+    <div class="row">
+      <button id="approve" class="primary">Approve reviewed plan & unlock workers</button>
+      <button id="pause">Pause project</button>
+      <button id="refresh">Refresh</button>
+      <button id="simulate">Run isolated demo</button>
+    </div>
+    <pre id="simulation" hidden></pre>
+    <details>
+      <summary>Create or activate a project without an AI interview</summary>
+      <form id="project-form">
+        <label for="project-name">Project name</label>
+        <input id="project-name" required>
+        <label for="project-description">Goal</label>
+        <textarea id="project-description"></textarea>
+        <label for="project-path">Existing workspace path (optional)</label>
+        <input id="project-path" placeholder="Leave blank for a fresh project directory">
+        <p><button>Create / activate project</button></p>
+      </form>
+    </details>
+  </section>
+
+  <section id="section-tasks">
+    <div class="row">
+      <h2>Task board · Active Work</h2>
+      <button id="clear-tasks">Clear paused task board</button>
+    </div>
+    <div id="active-spotlight"></div>
+    <div id="tasks"></div>
+    <details>
+      <summary>Add a task to the paused plan</summary>
+      <form id="task-form">
+        <label for="task-id">Task ID</label>
+        <input id="task-id" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,95}">
+        <label for="task-title">Title</label>
+        <input id="task-title" required>
+        <label for="task-description">Specification</label>
+        <textarea id="task-description" required></textarea>
+        <label for="task-files">Target files (comma separated)</label>
+        <input id="task-files" required>
+        <label for="task-deps">Dependencies (comma separated task IDs)</label>
+        <input id="task-deps">
+        <label for="task-tier">Required tier</label>
+        <select id="task-tier">
+          <option value="1">1 — Architecture / complex work</option>
+          <option value="2" selected>2 — Builder / tests</option>
+        </select>
+        <label for="task-verify">Verification commands (one per line)</label>
+        <textarea id="task-verify"></textarea>
+        <label><input id="task-tests" type="checkbox" style="width:auto"> Require a test suite</label>
+        <label><input id="task-browser" type="checkbox" style="width:auto"> Require browser verification</label>
+        <p><button>Add task</button></p>
+      </form>
+    </details>
+  </section>
+
+  <section>
+    <h2>Plan interview</h2>
+    <p class="muted">Choose an idle local architect. Answers never approve or execute a plan automatically.</p>
+    <form id="grill-form">
+      <div class="columns">
+        <div>
+          <label for="grill-name">Project name</label>
+          <input id="grill-name" required>
+          <label for="grill-idea">Goal / requirements</label>
+          <textarea id="grill-idea" required></textarea>
+        </div>
+        <div>
+          <label for="grill-agent">Architect</label>
+          <select id="grill-agent"></select>
+          <label for="grill-path">Workspace path (optional)</label>
+          <input id="grill-path">
+          <label><input id="grill-continue" type="checkbox" style="width:auto"> Continue the current / existing project</label>
+          <p><button>Start interview</button></p>
+        </div>
+      </div>
+    </form>
+    <p id="grill-progress" class="muted"></p>
+    <pre id="grill-question"></pre>
+    <div id="grill-options" class="row"></div>
+    <form id="answer-form">
+      <label for="grill-answer">Your answer</label>
+      <textarea id="grill-answer"></textarea>
+      <div class="row">
+        <button>Send answer</button>
+        <button id="compile" type="button">Compile plan for review</button>
+      </div>
+    </form>
+  </section>
+
+  <section>
+    <h2>Shared contracts</h2>
+    <textarea id="contracts" rows="16" spellcheck="false" aria-label="Shared contracts"></textarea>
+    <p id="contract-dirty" hidden>Unsaved contract edits. Live updates will preserve this draft. Approval uses the version you reviewed.</p>
+    <p class="muted">Review the contracts and tasks below before approving. Pause before changing an approved plan.</p>
+  </section>
+
+  <div class="columns">
+    <section>
+      <h2>Project questions</h2>
+      <form id="chat-form">
+        <label for="chat-agent">Local provider</label>
+        <select id="chat-agent"></select>
+        <label for="chat-question">Question</label>
+        <textarea id="chat-question" required></textarea>
+        <p><button>Ask selected provider</button></p>
+      </form>
+      <p class="muted">Answers use supplied project context. Coding changes run through tasks and QA.</p>
+      <div id="chat"></div>
+    </section>
+    <section>
+      <h2>Knowledge graph & documentation</h2>
+      <form id="graph-form">
+        <label for="graph-mode">Graph tool</label>
+        <select id="graph-mode"><option value="query">Query</option><option value="explain">Explain</option><option value="path">Path</option></select>
+        <label for="graph-query">Symbol / query</label>
+        <input id="graph-query" required>
+        <label for="graph-target">Path destination (optional)</label>
+        <input id="graph-target">
+        <p><button>Inspect graph</button></p>
+      </form>
+      <pre id="graph-result"></pre>
+      <form id="search-form">
+        <label for="search-query">Web search</label>
+        <input id="search-query" required>
+        <p><button>Search</button></p>
+      </form>
+      <div id="search-result"></div>
+      <form id="docs-form">
+        <label for="docs-url">Public HTTPS documentation URL</label>
+        <input id="docs-url" type="url" required>
+        <p><button>Read documentation</button></p>
+      </form>
+      <pre id="docs-result"></pre>
+    </section>
+  </div>
+
+  <section>
+    <h2>QA reports</h2>
+    <div id="qa"></div>
+  </section>
+
+  <section>
+    <h2>Activity</h2>
+    <div id="events"></div>
+  </section>
 </div>
-<section><h2>Plan interview</h2><p class="muted">Choose an idle local architect. Answers never approve or execute a plan automatically.</p><form id="grill-form"><div class="columns"><div><label for="grill-name">Project name</label><input id="grill-name" required><label for="grill-idea">Goal / requirements</label><textarea id="grill-idea" required></textarea></div><div><label for="grill-agent">Architect</label><select id="grill-agent"></select><label for="grill-path">Workspace path (optional)</label><input id="grill-path"><label><input id="grill-continue" type="checkbox" style="width:auto"> Continue the current / existing project</label><p><button>Start interview</button></p></div></div></form><p id="grill-progress" class="muted"></p><pre id="grill-question"></pre><div id="grill-options" class="row"></div><form id="answer-form"><label for="grill-answer">Your answer</label><textarea id="grill-answer"></textarea><div class="row"><button>Send answer</button><button id="compile" type="button">Compile plan for review</button></div></form></section>
-<section><h2>Shared contracts</h2><textarea id="contracts" rows="16" spellcheck="false" aria-label="Shared contracts"></textarea><p id="contract-dirty" hidden>Unsaved contract edits. Live updates will preserve this draft. Approval uses the version you reviewed.</p><p class="muted">Review the contracts and tasks below before approving. Pause before changing an approved plan.</p></section>
-<section><div class="row"><h2>Task board</h2><button id="clear-tasks">Clear paused task board</button></div><div id="tasks"></div><details><summary>Add a task to the paused plan</summary><form id="task-form"><label for="task-id">Task ID</label><input id="task-id" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,95}"><label for="task-title">Title</label><input id="task-title" required><label for="task-description">Specification</label><textarea id="task-description" required></textarea><label for="task-files">Target files (comma separated)</label><input id="task-files" required><label for="task-deps">Dependencies (comma separated task IDs)</label><input id="task-deps"><label for="task-tier">Required tier</label><select id="task-tier"><option value="1">1 — Architecture / complex work</option><option value="2" selected>2 — Builder / tests</option></select><label for="task-verify">Verification commands (one per line)</label><textarea id="task-verify"></textarea><label><input id="task-tests" type="checkbox" style="width:auto"> Require a test suite</label><label><input id="task-browser" type="checkbox" style="width:auto"> Require browser verification</label><p><button>Add task</button></p></form></details></section>
-<div class="columns"><section><h2>Project questions</h2><form id="chat-form"><label for="chat-agent">Local provider</label><select id="chat-agent"></select><label for="chat-question">Question</label><textarea id="chat-question" required></textarea><p><button>Ask selected provider</button></p></form><p class="muted">Answers use supplied project context. Coding changes run through tasks and QA.</p><div id="chat"></div></section><section><h2>Knowledge graph & documentation</h2><form id="graph-form"><label for="graph-mode">Graph tool</label><select id="graph-mode"><option value="query">Query</option><option value="explain">Explain</option><option value="path">Path</option></select><label for="graph-query">Symbol / query</label><input id="graph-query" required><label for="graph-target">Path destination (optional)</label><input id="graph-target"><p><button>Inspect graph</button></p></form><pre id="graph-result"></pre><form id="search-form"><label for="search-query">Web search</label><input id="search-query" required><p><button>Search</button></p></form><div id="search-result"></div><form id="docs-form"><label for="docs-url">Public HTTPS documentation URL</label><input id="docs-url" type="url" required><p><button>Read documentation</button></p></form><pre id="docs-result"></pre></section></div>
-<section><h2>QA reports</h2><div id="qa"></div></section><section><h2>Activity</h2><div id="events"></div></section>
+
+<div id="screen-workers" hidden>
+  <div class="row" style="margin-bottom:16px">
+    <button type="button" id="btn-back-to-project" class="tab-btn">← Back to Project & Tasks</button>
+  </div>
+  <div id="workers-container">
+    <div id="invite-columns" class="columns">
+      <section>
+        <h2>Worker nodes</h2>
+        <div id="agents"></div>
+        <details>
+          <summary>Register a local host executor</summary>
+          <p class="muted">Local execution and planning require the selected CLI and FUNGUYS_TRUSTED_EXECUTION=1. Remote workers run on their own machines.</p>
+          <form id="local-form">
+            <label for="local-name">Owner</label>
+            <input id="local-name" value="Host" required>
+            <label for="local-profile">Subscription profile</label>
+            <select id="local-profile"></select>
+            <p><button>Register local executor</button></p>
+          </form>
+        </details>
+      </section>
+      <section>
+        <h2>Invite a worker</h2>
+        <p class="muted">Requires Python 3.11+ and the selected AI CLI on the worker. No repository or FunGuys package installation is needed. Invitations expire in one hour and enroll one machine.</p>
+        <form id="invite-form">
+          <label for="invite-target">Connection type</label>
+          <select id="invite-target"></select>
+          <label for="invite-name">Owner name</label>
+          <input id="invite-name" value="Teammate" required>
+          <label for="invite-code">Machine code name</label>
+          <input id="invite-code" placeholder="Uses the worker's hostname when blank">
+          <label for="invite-profile">Subscription profile</label>
+          <select id="invite-profile"></select>
+          <p><button>Create invitation</button></p>
+        </form>
+        <div id="invite-result" hidden>
+          <label for="win-command">Windows PowerShell</label>
+          <textarea id="win-command" class="commands" readonly></textarea>
+          <button data-copy="win-command">Copy Windows command</button>
+          <label for="bash-command">Mac / Linux Bash</label>
+          <textarea id="bash-command" class="commands" readonly></textarea>
+          <button data-copy="bash-command">Copy Bash command</button>
+          <p id="invite-expiry" class="muted"></p>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
 </main>
 </body></html>

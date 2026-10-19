@@ -127,9 +127,13 @@ class GrillArchitectEngine:
 
     def _call_architect_llm_json(self, prompt, timeout_sec=90, progress_cb=None):
         from funguys.worker.adapters import run_text_agent
+        from funguys.host.workflow_log import NULL_LOGGER
+        log = getattr(self, 'logger', None) or NULL_LOGGER
         self._update_phase("HEAD_BOT_THINKING", f"Consulting selected {self.provider} provider", progress_cb)
+        raw = None
         try:
             raw = run_text_agent(self.provider, prompt + "\nReturn only the requested JSON object. Do not call tools.", timeout_sec)
+            log.log('architect_response', f'{self.provider} answered', provider=self.provider, timeout_sec=timeout_sec, prompt=prompt, raw=raw)
             decoder = json.JSONDecoder()
             for start, character in enumerate(raw):
                 if character != "{":
@@ -142,6 +146,7 @@ class GrillArchitectEngine:
                     return result
             raise ValueError("Selected architect returned invalid JSON. Retry planning; no fallback plan was substituted.")
         except Exception as exc:
+            log.exception('architect_failed', f'{self.provider} architect call failed', exc, provider=self.provider, timeout_sec=timeout_sec, prompt=prompt, raw=raw)
             self._update_phase("ERROR", str(exc), progress_cb, error=str(exc))
             raise
 
@@ -247,7 +252,7 @@ class GrillArchitectEngine:
             f"Return ONLY valid JSON with this exact schema:\n"
             f'{{"question": "...", "options": ["(Recommended) ...", "Option 2 ...", "Option 3 ..."], "ready_to_compile_hint": false}}'
         )
-        llm_q = self._call_architect_llm_json(prompt, timeout_sec=25, progress_cb=progress_cb)
+        llm_q = self._call_architect_llm_json(prompt, timeout_sec=120, progress_cb=progress_cb)
         if (
             llm_q
             and isinstance(llm_q.get("question"), str)
@@ -351,16 +356,27 @@ class GrillArchitectEngine:
         ):
             contracts_md = llm_plan["contracts_markdown"]
             tasks: List[TaskItem] = []
+            import re as _re
+
+            def _clean_id(value, fallback):
+                cleaned = _re.sub(r'[^A-Za-z0-9_-]+', '-', str(value or '')).strip('-_')[:96]
+                return cleaned or fallback
+
+            id_map = {str(raw_t.get("id")): _clean_id(raw_t.get("id"), f"task-{i+1}") for i, raw_t in enumerate(llm_plan["tasks"]) if raw_t.get("id")}
             for idx, raw_t in enumerate(llm_plan["tasks"]):
-                tid = str(raw_t.get("id") or f"task-{idx+1}")
-                deps = [str(d) for d in (raw_t.get("dependencies") or [])]
+                tid = _clean_id(raw_t.get("id"), f"task-{idx+1}")
+                deps = [id_map.get(str(d), _clean_id(d, str(d))) for d in (raw_t.get("dependencies") or [])]
+                try:
+                    tier = 1 if int(raw_t.get("complexity_tier") or (1 if idx == 0 else 2)) <= 1 else 2
+                except (TypeError, ValueError):
+                    tier = 2
                 tasks.append(
                     TaskItem(
                         id=tid,
                         title=str(raw_t.get("title") or f"Phase {idx+1} Module"),
                         description=str(raw_t.get("description") or idea),
-                        phase=int(raw_t.get("phase") or (1 if not deps else 2)),
-                        complexity_tier=int(raw_t.get("complexity_tier") or (1 if idx == 0 else 2)),
+                        phase=max(1, int(raw_t.get("phase") or (1 if not deps else 2))),
+                        complexity_tier=tier,
                         dependencies=deps,
                         target_files=[str(f) for f in (raw_t.get("target_files") or [f"module_{idx+1}.py"])],
                         exported_symbols=[str(s) for s in (raw_t.get("exported_symbols") or [])],

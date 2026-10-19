@@ -93,7 +93,7 @@ class BodyLimit:
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http':
             return await self.app(scope, receive, send)
-        limit, chunks, size = 30_000_000, [], 0
+        limit, chunks, size = 80_000_000, [], 0
         while True:
             message = await receive()
             if message['type'] == 'http.disconnect':
@@ -139,6 +139,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         await asyncio.gather(*(deliver(ws) for ws in list(clients)))
     orch = FunGuysOrchestrator(store, state_dir / 'workspaces', broadcast)
     grill = GrillArchitectEngine()
+    grill.logger = orch.wlog
     session_file = state_dir / 'grill_session.json'
     if session_file.exists():
         try:
@@ -162,6 +163,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
                     app.state.public_url = tunnel_url_provider()
                 await orch.schedule_ready_tasks()
             except Exception as exc:
+                orch.wlog.exception('maintenance_error', 'Scheduler loop failed', exc)
                 await orch.emit_event('host', 'maintenance_error', str(exc))
             await asyncio.sleep(5)
 
@@ -170,6 +172,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
             try:
                 await orch.run_autonomous_execution_loop()
             except Exception as exc:
+                orch.wlog.exception('local_execution_error', 'Local execution loop failed', exc)
                 await orch.emit_event('host','local_execution_error',str(exc))
             await asyncio.sleep(2)
 
@@ -265,6 +268,20 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
     @app.post('/api/invites')
     async def create_invite():
         return access.invite()
+
+    @app.post('/api/host/restart')
+    async def restart_host():
+        import sys, os, subprocess
+        async def do_restart():
+            await asyncio.sleep(0.5)
+            # Spawn a new host process using the same python interpreter and arguments
+            args = [sys.executable, *sys.argv]
+            env = os.environ.copy()
+            env['FUNGUYS_TRUSTED_EXECUTION'] = '1'
+            subprocess.Popen(args, cwd=str(root), env=env)
+            os._exit(0)
+        asyncio.create_task(do_restart())
+        return {'restarting': True}
 
     @app.get('/api/state')
     async def get_state():
@@ -578,10 +595,13 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         finally:
             clients.discard(ws)
 
-    @app.get('/worker.py',response_class=PlainTextResponse)
+    @app.get('/worker.py')
     async def worker_source():
+        from fastapi import Response
         path = Path(__file__).parent.parent/'worker'/'runtime.py'
-        return PlainTextResponse(path.read_text(encoding='utf-8'))
+        # Serve LF-normalized bytes to guarantee exact hash match across Windows and Linux
+        content = path.read_bytes().replace(b'\r\n', b'\n')
+        return Response(content=content, media_type='text/plain; charset=utf-8')
 
     def join_config(request,token,name,codename,profile,used_pct):
         identity = access.identify(token)
@@ -589,7 +609,10 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
             raise HTTPException(401,'A current invitation is required')
         if profile not in SUBSCRIPTION_PROFILES:
             raise ValueError('Unknown profile')
-        return {'host_url':app.state.public_url or str(request.base_url).rstrip('/'), 'token':token, 'name':name, 'codename':codename, 'profile':profile, 'used_pct':used_pct}
+        request_base = str(request.base_url).rstrip('/')
+        # Use request's actual host URL if accessed locally/LAN, fallback to public_url only if request came via tunnel
+        host_url = request_base if not app.state.public_url or any(h in request_base for h in ('localhost', '127.0.0.1', app.state.lan_ip)) else app.state.public_url
+        return {'host_url':host_url, 'token':token, 'name':name, 'codename':codename, 'profile':profile, 'used_pct':used_pct}
 
     @app.get('/join.ps1',response_class=PlainTextResponse)
     async def join_ps(request:Request,token:str='',name:str='Teammate',codename:str='',profile:str='codex-pro',used_pct:float=0):
