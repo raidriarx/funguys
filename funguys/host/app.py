@@ -237,7 +237,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
 
     def state():
         project = store.get_project()
-        return {'host_instance':host_instance,'state_sequence':next(state_counter),'project':project.model_dump(), 'tasks':[orch.public_task(t) for t in store.list_tasks()], 'agents':[orch.public_agent(a) for a in store.list_agents()], 'qa_reports':[r.model_dump() for r in store.list_qa_reports() if r.project_id==project.id], 'contract_alerts':[a.model_dump() for a in store.list_contract_alerts() if a.project_id==project.id], 'events':[e.model_dump() for e in store.list_events()], 'chat_history':[c for c in store.list_chat() if c.get('project_id')==project.id], 'graph':orch.graph.last_graph_data, 'graph_report_markdown':'', 'grill':grill.session.model_dump(), 'lan_ip':app.state.lan_ip, 'listen_host':bind_host, 'public_url':app.state.public_url, 'available_workspaces':[{'path':str(p), 'folder_name':p.name, 'project_name':p.name} for p in sorted((state_dir/'workspaces').iterdir()) if p.is_dir()], 'profiles':{key:{'provider':p.provider,'display_name':p.display_name,'tier':p.tier} for key,p in SUBSCRIPTION_PROFILES.items()}}
+        return {'host_instance':host_instance,'state_sequence':next(state_counter),'project':project.model_dump(), 'tasks':[orch.public_task(t) for t in store.list_tasks()], 'agents':[orch.public_agent(a) for a in store.list_agents()], 'qa_reports':[r.model_dump() for r in store.list_qa_reports() if r.project_id==project.id], 'contract_alerts':[a.model_dump() for a in store.list_contract_alerts() if a.project_id==project.id], 'events':[e.model_dump() for e in store.list_events()], 'chat_history':[c for c in store.list_chat() if c.get('project_id')==project.id], 'graph':orch.graph.last_graph_data, 'graph_report_markdown':'', 'grill':grill.session.model_dump(), 'lan_ip':app.state.lan_ip, 'listen_host':bind_host, 'public_url':app.state.public_url, 'available_workspaces':[{'path':str(p), 'folder_name':p.name, 'project_name':p.name} for p in sorted((state_dir/'workspaces').iterdir()) if p.is_dir()], 'profiles':{key:{'provider':p.provider,'display_name':p.display_name,'tier':p.tier} for key,p in SUBSCRIPTION_PROFILES.items()}, 'btw': orch.get_btw_session()}
 
     async def sync():
         await broadcast({'type':'state_sync', 'state':state()})
@@ -275,7 +275,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         async def do_restart():
             await asyncio.sleep(0.5)
             # Spawn a new host process using the same python interpreter and arguments
-            args = [sys.executable, *sys.argv]
+            args = [sys.executable, '-m', 'funguys.cli', 'host']
             env = os.environ.copy()
             env['FUNGUYS_TRUSTED_EXECUTION'] = '1'
             subprocess.Popen(args, cwd=str(root), env=env)
@@ -531,6 +531,12 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
     @app.post('/api/chat/ask')
     async def chat(req:AskAgentRequest):
         result = await orch.ask_project_question(req.question,req.preferred_agent_id)
+        await sync()
+        return result
+
+    @app.post('/api/chat/btw/end')
+    async def end_btw():
+        result = await orch.end_btw_session()
         await sync()
         return result
 

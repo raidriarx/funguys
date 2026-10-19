@@ -150,6 +150,57 @@ def test_real_http_worker_recovers_assignment_created_during_registration(tmp_pa
     assert not worker_errors,worker_errors
 
 
+def test_worker_recovers_from_stale_identity_file_using_fresh_invite(tmp_path):
+    import json, hashlib
+    app = create_host_app(tmp_path, admin_token='audit-admin-token')
+    admin = TestClient(app, headers={'Authorization': 'Bearer audit-admin-token'})
+    token = admin.post('/api/invites').json()['token']
+
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_level='error'))
+    server_thread = threading.Thread(target=server.run, kwargs={'sockets': [listener]}, daemon=True)
+    server_thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(.02)
+    assert server.started
+
+    state_dir = tmp_path / 'worker-identity'
+    state_dir.mkdir(parents=True, exist_ok=True)
+    machine = 'stale-node'
+    host_url = f'http://127.0.0.1:{port}'
+    name = hashlib.sha256((host_url + '\n' + machine).encode()).hexdigest()[:24]
+    identity_file = state_dir / (name + '.json')
+    identity_file.write_text(json.dumps({
+        'worker_id': 'stale-worker-id',
+        'token': 'invalid-or-revoked-token',
+        'agent_id': 'agent-old'
+    }), encoding='utf-8')
+
+    worker = WorkerRuntime({
+        'host_url': host_url,
+        'name': 'Friend',
+        'codename': machine,
+        'profile': 'codex-pro',
+        'token': token,
+        'state_dir': str(state_dir)
+    })
+    try:
+        result = worker.register()
+        assert result['id'].startswith('agent-')
+        assert worker.token != 'invalid-or-revoked-token'
+        assert worker.token == result['worker_token']
+        saved = json.loads(identity_file.read_text(encoding='utf-8'))
+        assert saved['token'] == result['worker_token']
+        assert saved['agent_id'] == result['id']
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
+        listener.close()
+
+
 def test_typescript_interface_shape_change_is_detected(tmp_path):
     from funguys.host.graph_engine import GraphifyEngine
     source=tmp_path/'types.ts'

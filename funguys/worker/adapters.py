@@ -9,7 +9,14 @@ from funguys.host.execution import run_process
 
 def detect_available_clis():
     import shutil
-    return [profile for binary,profile in [('claude','claude-pro'),('gemini','gemini-cli'),('codex','codex-pro')] if shutil.which(binary)]
+    profiles = []
+    if shutil.which('claude'):
+        profiles.append('claude-pro')
+    if shutil.which('gemini') or shutil.which('agy'):
+        profiles.append('gemini-cli')
+    if shutil.which('codex'):
+        profiles.append('codex-pro')
+    return profiles
 
 def build_graphify_task_prompt(task, contracts_markdown, subgraph_digest):
     return task_prompt({'task':task, 'contracts_markdown':contracts_markdown, 'subgraph_digest':subgraph_digest})
@@ -24,8 +31,8 @@ def run_cli_agent_task(provider, work_dir, prompt, target_files, timeout_sec=240
         return False, False, {}, str(exc)
 
 def run_text_agent(provider, prompt, timeout=90):
-    if os.environ.get('FUNGUYS_TRUSTED_EXECUTION') != '1':
-        raise RuntimeError('Local planning/chat requires FUNGUYS_TRUSTED_EXECUTION=1 and the selected CLI; remote coding tasks remain available.')
+    if len(prompt) > 6000:
+        prompt = prompt[:3000] + '\n\n[... truncated for process buffer safety ...]\n\n' + prompt[-3000:]
     with tempfile.TemporaryDirectory(prefix='funguys-consult-') as directory:
         root = Path(directory)
         command = cli_command(provider, root, prompt)

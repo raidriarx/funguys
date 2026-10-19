@@ -136,14 +136,23 @@
   <div class="columns">
     <section>
       <h2>Project questions</h2>
+      <div id="btw-banner" style="display:none;background:#0d1c14;border:1px solid #4a9;padding:12px;margin-bottom:12px">
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <strong class="good">⚡ Active Side Conversation (/btw)</strong>
+            <div id="btw-status-text" class="muted" style="font-size:11px;margin-top:4px"></div>
+          </div>
+          <button type="button" id="end-btw-btn">End side conversation</button>
+        </div>
+      </div>
       <form id="chat-form">
-        <label for="chat-agent">Local provider</label>
+        <label for="chat-agent">Consult agent</label>
         <select id="chat-agent"></select>
-        <label for="chat-question">Question</label>
-        <textarea id="chat-question" required></textarea>
-        <p><button>Ask selected provider</button></p>
+        <label for="chat-question">Question or /btw guidance</label>
+        <textarea id="chat-question" placeholder="Ask a question or prefix with /btw to guide active work..." required></textarea>
+        <p><button id="chat-submit-btn">Ask agent</button></p>
       </form>
-      <p class="muted">Answers use supplied project context. Coding changes run through tasks and QA.</p>
+      <p class="muted">Answers use supplied project context. Prefix with /btw to provide persistent guidance to a working agent without interrupting their active task.</p>
       <div id="chat"></div>
     </section>
     <section>

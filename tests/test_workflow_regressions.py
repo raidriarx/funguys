@@ -312,3 +312,58 @@ def test_case_colliding_files_are_rejected_before_any_write(tmp_path):
     with pytest.raises(ValueError,match='collide'):
         write_snapshot(tmp_path,{'files':{'A.py':'first','a.py':'second'}})
     assert not list(tmp_path.iterdir())
+
+
+def test_btw_side_conversation_lifecycle_and_guidance(host, monkeypatch):
+    app, client = host
+    from funguys.worker import adapters
+    monkeypatch.setattr(adapters, 'run_text_agent', lambda provider, prompt: f"Response from {provider}")
+
+    agent = register(client, 'Alex', 'codex-pro', 0)
+    approved = approve(client)
+    task = next(t for t in approved['tasks'] if t['assigned_agent_id'] == agent['id'])
+    assert task['status'] == 'in_progress'
+
+    state = client.get('/api/state').json()
+    working_agent = next(a for a in state['agents'] if a['id'] == agent['id'])
+    assert working_agent['status'] == 'working'
+    assert state['btw'] is None
+
+    # 1. Ask a question using /btw to start side conversation with working agent
+    resp = client.post('/api/chat/ask', json={'question': '/btw remember to clamp paddle coordinate to canvas bounds', 'preferred_agent_id': 'auto'})
+    assert resp.status_code == 200, resp.text
+    chat_entry = resp.json()
+    assert chat_entry['is_btw'] is True
+    assert chat_entry['agent_id'] == agent['id']
+
+    # Working agent remains in WORKING status, not set to idle or disturbed
+    state_after = client.get('/api/state').json()
+    working_agent_after = next(a for a in state_after['agents'] if a['id'] == agent['id'])
+    assert working_agent_after['status'] == 'working'
+
+    # Check state exposes the active btw session
+    btw = state_after['btw']
+    assert btw is not None
+    assert btw['active'] is True
+    assert btw['agent_id'] == agent['id']
+    assert btw['task_id'] == task['id']
+    assert 'clamp paddle' in btw['notes'][0]
+
+    # 2. Subsequent questions remain connected in the side conversation without needing /btw prefix
+    resp2 = client.post('/api/chat/ask', json={'question': 'what is the current status of the engine?', 'preferred_agent_id': 'auto'})
+    assert resp2.status_code == 200
+    state_turn2 = client.get('/api/state').json()
+    assert state_turn2['btw']['turns'] == 2
+
+    # 3. End the side conversation via POST /api/chat/btw/end
+    end_resp = client.post('/api/chat/btw/end')
+    assert end_resp.status_code == 200
+    assert end_resp.json()['ended'] is True
+
+    # State now shows no active btw session
+    state_ended = client.get('/api/state').json()
+    assert state_ended['btw'] is None
+
+    # Check that task's handoff_digest has recorded the guidance notes
+    updated_task = next(t for t in state_ended['tasks'] if t['id'] == task['id'])
+    assert 'clamp paddle' in (updated_task.get('handoff_digest') or '')

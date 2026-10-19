@@ -29,6 +29,7 @@ class FunGuysOrchestrator:
         self._local_cancellations = {}
         self._consulting_agents = set()
         self._planning = False
+        self.btw_session = None
         self.lease_seconds = 90
         self.chat_history = store.list_chat()
         project = store.get_project()
@@ -690,38 +691,178 @@ class FunGuysOrchestrator:
         finally:
             self._auto_loop_running = False
 
+    def get_btw_session(self):
+        if not self.btw_session:
+            return None
+        agent = self.store.get_agent(self.btw_session['agent_id'])
+        if not agent:
+            self.btw_session = None
+            return None
+        return {
+            **self.btw_session,
+            'active': True,
+            'turns': len(self.btw_session.get('messages', [])) // 2,
+            'agent_status': agent.status.value,
+            'current_task_id': agent.current_task_id,
+        }
+
+    async def end_btw_session(self):
+        async with self._state_lock:
+            session = self.btw_session
+            if not session:
+                return {'ended': False, 'message': 'No active side conversation'}
+            task_id = session.get('task_id')
+            notes = session.get('notes', [])
+            agent_label = session.get('agent_label', 'Agent')
+            if task_id and notes:
+                task = self.store.get_task(task_id)
+                if task:
+                    guidance = '\n'.join(f'- {n}' for n in notes)
+                    prefix = f'{task.handoff_digest}\n\n' if task.handoff_digest else ''
+                    task.handoff_digest = f'{prefix}### User /btw Side Conversation Guidance\n{guidance}'
+                    self.store.save_task(task)
+                    await self.emit_event(task_id, 'btw_guidance_committed', f'Side conversation with {agent_label} ended. Recorded {len(notes)} guidance note(s) on {task_id}.')
+            self.btw_session = None
+        return {'ended': True}
+
     async def ask_project_question(self, question, preferred_agent_id=None):
         from funguys.worker.adapters import run_text_agent
+        clean_q = question.strip()
+        is_btw = clean_q.lower().startswith('/btw')
+        btw_note = clean_q[4:].strip() if is_btw else None
+
         async with self._state_lock:
             if self._planning:
                 raise ConflictError('Architect consultation is already in progress')
             agents = self.store.list_agents()
-            selected = next((a for a in agents if a.id == preferred_agent_id),None) if preferred_agent_id and preferred_agent_id != 'auto' else None
-            if preferred_agent_id and preferred_agent_id != 'auto' and not selected:
-                raise ValueError('Selected agent does not exist')
+            if not agents:
+                raise ConflictError('No agents are currently registered or connected.')
+
+            # 1. If an active side conversation is connected, route follow-ups to that agent
+            selected = None
+            if self.btw_session and self.btw_session.get('agent_id'):
+                selected = next((a for a in agents if a.id == self.btw_session['agent_id']), None)
+
+            # 2. If a specific preferred agent was requested
+            if not selected and preferred_agent_id and preferred_agent_id != 'auto':
+                selected = next((a for a in agents if a.id == preferred_agent_id), None)
+                if not selected:
+                    raise ValueError('Selected agent does not exist')
+
+            # 3. Intelligent default routing
             if not selected:
-                selected = min((a for a in agents if a.executor == 'local' and a.status == AgentStatus.IDLE and a.id not in self._consulting_agents),key=lambda a:a.tier,default=None)
-            if not selected or selected.executor != 'local':
-                raise ConflictError('Interactive chat requires an idle local agent. Remote workers accept coding tasks only; no different provider was substituted.')
-            if selected.status != AgentStatus.IDLE or selected.id in self._consulting_agents or selected.used_pct >= selected.soft_limit_pct:
-                raise ConflictError('Selected agent is busy or unavailable')
-            self._consulting_agents.add(selected.id)
-            selected.status = AgentStatus.WORKING
-            self.store.save_agent(selected)
+                if is_btw:
+                    # Prefer currently working agent for /btw notes
+                    selected = next((a for a in agents if a.status == AgentStatus.WORKING and a.current_task_id), None)
+                if not selected:
+                    # Prefer idle agent (Tier 1 first)
+                    selected = min((a for a in agents if a.status == AgentStatus.IDLE and a.id not in self._consulting_agents), key=lambda a: a.tier, default=None)
+                if not selected:
+                    # Fall back to any connected agent (including working agents)
+                    selected = min(agents, key=lambda a: a.tier, default=None)
+
+            if not selected:
+                raise ConflictError('No agent is available to answer questions.')
+            if selected.used_pct >= selected.soft_limit_pct:
+                raise ConflictError('Selected agent has reached its soft quota limit.')
+
+            is_side_convo = is_btw or bool(self.btw_session) or (selected.status == AgentStatus.WORKING)
+
+            if is_side_convo:
+                if not self.btw_session or self.btw_session.get('agent_id') != selected.id:
+                    self.btw_session = {
+                        'id': 'btw-' + uuid.uuid4().hex[:8],
+                        'agent_id': selected.id,
+                        'agent_codename': selected.machine_name,
+                        'agent_label': selected.display_name,
+                        'task_id': selected.current_task_id,
+                        'messages': [],
+                        'notes': [],
+                    }
+                if is_btw and btw_note:
+                    self.btw_session['notes'].append(btw_note)
+                    if selected.current_task_id:
+                        task = self.store.get_task(selected.current_task_id)
+                        if task:
+                            prefix = f'{task.handoff_digest}\n\n' if task.handoff_digest else ''
+                            task.handoff_digest = f'{prefix}[User /btw guidance]: {btw_note}'
+                            self.store.save_task(task)
+
+            # Only track consultation status for idle agents so working agents are not disturbed
+            was_idle = (selected.status == AgentStatus.IDLE)
+            if was_idle:
+                self._consulting_agents.add(selected.id)
+                selected.status = AgentStatus.WORKING
+                self.store.save_agent(selected)
+
             project = self.store.get_project()
+            current_task = self.store.get_task(selected.current_task_id) if selected.current_task_id else None
+
         try:
-            files = await asyncio.to_thread(bundle,self.git.workspace_path)
-            context = '\n'.join(f'FILE {name}\n{content[:2500]}' for name,content in list(files['files'].items())[:12])
-            prompt = f'Answer this question using the supplied context. Do not call tools or edit files. Project: {project.name}\nContracts: {project.contracts_markdown}\n{context}\nQuestion: {question}'
-            answer = await asyncio.to_thread(run_text_agent,selected.provider,prompt)
-            entry = {'id':'msg-'+uuid.uuid4().hex,'project_id':project.id,'timestamp':utc_now_iso(),'question':question,'answer':answer,'agent_id':selected.id,'agent_codename':selected.machine_name,'agent_label':selected.display_name,'routing_reason':'Executed by the selected local provider','matched_domain':'Project context'}
-            self.store.save_chat(entry)
-            self.chat_history = self.store.list_chat()
-            return entry
-        finally:
+            files = await asyncio.to_thread(bundle, self.git.workspace_path)
+            target_names = set(current_task.target_files if current_task else [])
+            selected_items = [item for item in files['files'].items() if item[0] in target_names]
+            if not selected_items:
+                selected_items = list(files['files'].items())[:3]
+            context = '\n'.join(f'FILE {name}\n{content[:800]}' for name, content in selected_items[:3])
+            contracts_excerpt = (project.contracts_markdown or '')[:1500]
+
+            task_info = ''
+            if current_task:
+                task_info = (
+                    f"\nActive Assignment Context:\n"
+                    f"You are currently working on task {current_task.id}: '{current_task.title}'\n"
+                    f"Task Specification:\n{current_task.description}\n"
+                    f"Target Files: {', '.join(current_task.target_files)}\n"
+                    f"Current Task Status: {current_task.status.value}\n"
+                    f"Known Failures to Address: {current_task.last_error or 'None'}\n"
+                )
+
+            history_info = ''
+            if self.btw_session and self.btw_session.get('messages'):
+                history_lines = [f"{m['role'].upper()}: {m['text']}" for m in self.btw_session['messages'][-4:]]
+                history_info = '\nRecent side conversation history:\n' + '\n'.join(history_lines) + '\n'
+
+            prompt = (
+                f"You are {selected.display_name} on {selected.machine_name}.\n"
+                f"You are participating in a conversation with the user about the project.\n"
+                f"Project: {project.name}\nContracts excerpt:\n{contracts_excerpt}\n"
+                f"{task_info}"
+                f"{history_info}"
+                f"Workspace Excerpts:\n{context}\n\n"
+                f"User: {clean_q}\n\n"
+                f"Answer the user's question directly, concisely, and helpfully based on the context above. "
+                f"If the user gave a '/btw' note or guidance for your current task, acknowledge it and explain briefly how it applies. "
+                f"Do not call tools or attempt file editing in this response."
+            )
+            answer = await asyncio.to_thread(run_text_agent, selected.provider, prompt)
+
             async with self._state_lock:
-                self._consulting_agents.discard(selected.id)
-                agent = self.store.get_agent(selected.id)
-                if agent and not agent.current_task_id:
-                    agent.status = AgentStatus.COOLDOWN if agent.cooldown_until else AgentStatus.IDLE
-                    self.store.save_agent(agent)
+                if self.btw_session:
+                    self.btw_session['messages'].append({'role': 'user', 'text': clean_q, 'timestamp': utc_now_iso(), 'is_btw': is_btw})
+                    self.btw_session['messages'].append({'role': 'agent', 'text': answer, 'timestamp': utc_now_iso()})
+
+                entry = {
+                    'id': 'msg-' + uuid.uuid4().hex,
+                    'project_id': project.id,
+                    'timestamp': utc_now_iso(),
+                    'question': clean_q,
+                    'answer': answer,
+                    'agent_id': selected.id,
+                    'agent_codename': selected.machine_name,
+                    'agent_label': selected.display_name,
+                    'routing_reason': f"Side conversation with {selected.machine_name}" if is_side_convo else f"Executed by {selected.display_name}",
+                    'matched_domain': 'Task /btw Guidance' if is_btw else 'Project context',
+                    'is_btw': is_btw,
+                }
+                self.store.save_chat(entry)
+                self.chat_history = self.store.list_chat()
+                return entry
+        finally:
+            if was_idle:
+                async with self._state_lock:
+                    self._consulting_agents.discard(selected.id)
+                    agent = self.store.get_agent(selected.id)
+                    if agent and not agent.current_task_id:
+                        agent.status = AgentStatus.COOLDOWN if agent.cooldown_until else AgentStatus.IDLE
+                        self.store.save_agent(agent)

@@ -130,7 +130,26 @@ function render(data) {
   fillSelect('invite-profile',profiles,'codex-pro'); fillSelect('local-profile',profiles,'codex-pro');
   const locals=data.agents.filter(a => a.executor==='local').map(a => [a.id,`${a.machine_name} · ${a.display_name} · ${a.status}`]);
   fillSelect('grill-agent',[['','Auto: idle local architect'],...locals]);
-  fillSelect('chat-agent',[['auto','Auto: idle local provider'],...locals]);
+  const allAgents=data.agents.map(a => [a.id,`${a.machine_name} (${a.display_name}) · ${a.status.toUpperCase()} [${a.executor}]`]);
+  fillSelect('chat-agent',[['auto','Auto: best available agent'],...allAgents]);
+
+  const btwBanner=$('btw-banner');
+  if (btwBanner) {
+    if (data.btw && data.btw.active) {
+      btwBanner.style.display='block';
+      const targetAgent=data.agents.find(a => a.id===data.btw.agent_id);
+      const agentName=targetAgent ? `${targetAgent.machine_name} (${targetAgent.display_name})` : (data.btw.agent_codename || 'Agent');
+      const taskPart=data.btw.task_id ? ` · Working on task ${data.btw.task_id}` : '';
+      const turnsPart=data.btw.turns ? ` · ${data.btw.turns} turn(s)` : '';
+      const notesCount=data.btw.notes ? data.btw.notes.length : 0;
+      const notesPart=notesCount ? ` · ${notesCount} guidance note(s) recorded` : '';
+      $('btw-status-text').textContent=`Connected with ${agentName}${taskPart}${turnsPart}${notesPart}`;
+      $('chat-agent').value=data.btw.agent_id;
+    } else {
+      btwBanner.style.display='none';
+    }
+  }
+
   renderAgents(data.agents); renderTasks(data.tasks); renderReports(data.qa_reports);
   const grill=data.grill;
   $('grill-progress').textContent=grill.current_phase_detail || 'Start an interview, or define tasks manually.';
@@ -138,7 +157,9 @@ function render(data) {
   $('grill-options').replaceChildren(...(grill.status==='grilling' ? (grill.current_question?.options || []).map(option => button(option,() => answer(option))) : []));
   $('compile').disabled=grill.status!=='grilling';
   $('chat').replaceChildren(...data.chat_history.slice(-10).map(entry => {
-    const node=card(entry.agent_codename || 'Provider',entry.question); node.append(el('pre',entry.answer)); return node;
+    const title=entry.is_btw ? `⚡ [SIDE CONVERSATION] ${entry.agent_codename || 'Provider'}` : (entry.agent_codename || 'Provider');
+    const subtitle=entry.is_btw ? `[Guidance /btw] ${entry.question}` : entry.question;
+    const node=card(title,subtitle); node.append(el('pre',entry.answer)); return node;
   }));
   $('events').replaceChildren(...data.events.slice(0,40).map(event => el('p',`${new Date(event.timestamp).toLocaleTimeString()} [${event.source}] ${event.message}`)));
 }
@@ -314,6 +335,7 @@ bind('compile',async () => { await api('/api/grill/compile',{}); contractsDirty=
 const csv=value => value.split(',').map(x => x.trim()).filter(Boolean);
 bind('task-form',async () => { await api('/api/tasks',{id:$('task-id').value,title:$('task-title').value,description:$('task-description').value,target_files:csv($('task-files').value),dependencies:csv($('task-deps').value),complexity_tier:Number($('task-tier').value),verification_commands:$('task-verify').value.split('\n').map(x => x.trim()).filter(Boolean),require_tests:$('task-tests').checked,require_browser:$('task-browser').checked}); await refresh(); },true);
 bind('clear-tasks',async () => { if (confirm('Clear the paused task plan? Active work must be paused first.')) { await api('/api/tasks',undefined,'DELETE'); contractsDirty=false; await refresh(); } });
+bind('end-btw-btn',async () => { await api('/api/chat/btw/end',{}); await refresh(); });
 bind('chat-form',async () => { await api('/api/chat/ask',{question:$('chat-question').value,preferred_agent_id:$('chat-agent').value}); $('chat-question').value=''; await refresh(); },true);
 bind('graph-form',async () => { const result=await api(`/api/graphify/${$('graph-mode').value}`,{query:$('graph-query').value,target:$('graph-target').value}); $('graph-result').textContent=result.result; },true);
 bind('docs-form',async () => { const result=await api('/api/tools/fetch-docs',{url:$('docs-url').value}); $('docs-result').textContent=result.markdown; },true);

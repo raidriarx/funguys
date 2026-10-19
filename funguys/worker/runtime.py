@@ -107,6 +107,8 @@ def collect_changes(root, snapshot):
 
 def cli_command(provider, root, prompt):
     binary = shutil.which(provider)
+    if not binary and provider == 'gemini':
+        binary = shutil.which('agy')
     if not binary:
         raise RuntimeError(f'The selected {provider} CLI is not installed on this machine; no provider was substituted')
     prefix = [binary]
@@ -122,6 +124,8 @@ def cli_command(provider, root, prompt):
     if provider == 'claude':
         return [*prefix, '-p', prompt, '--permission-mode', 'acceptEdits', '--tools', 'Read,Edit,Write,Glob,Grep']
     if provider == 'gemini':
+        if Path(binary).stem.lower() == 'agy':
+            return [*prefix, '-p', prompt, '--sandbox', '--dangerously-skip-permissions']
         return [*prefix, '-p', prompt, '--sandbox']
     raise RuntimeError('API fallback is not configured; choose an installed CLI provider')
 
@@ -136,7 +140,7 @@ def stop_process(proc):
     proc.wait(timeout=10)
 
 
-def execute_cli(provider, root, prompt, cancelled=None, timeout=240):
+def execute_cli(provider, root, prompt, cancelled=None, timeout=600):
     command = cli_command(provider, root, prompt)
     code,text = capture_process(command,root,timeout=timeout,cancelled=cancelled)
     limited = bool(re.search(r'rate[\s_-]?limit|\b429\b|quota[\s_-]?exceeded|usage[\s_-]?limit|too many requests', text, re.I))
@@ -195,12 +199,32 @@ class WorkerRuntime:
         parsed = urllib.parse.urlsplit(self.host)
         if parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.username or parsed.path or parsed.query or parsed.fragment:
             raise ValueError('Host must be an HTTP(S) origin')
-        self.machine = config.get('codename') or platform.node() or 'worker'
-        name = hashlib.sha256((self.host + '\n' + self.machine).encode()).hexdigest()[:24]
+        profile = config.get('profile', '')
+        self.machine = config.get('codename') or (f"{platform.node() or 'worker'}-{profile}" if profile else (platform.node() or 'worker'))
+        base_name = hashlib.sha256((self.host + '\n' + self.machine).encode()).hexdigest()[:24]
+        prof_name = hashlib.sha256((self.host + '\n' + self.machine + '\n' + profile).encode()).hexdigest()[:24] if profile else base_name
         self.state_dir = Path(config.get('state_dir') or Path.home() / '.funguys' / 'workers')
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.identity_path = self.state_dir / (name + '.json')
-        self.identity = json.loads(self.identity_path.read_text(encoding='utf-8')) if self.identity_path.exists() else {'worker_id': uuid.uuid4().hex}
+        if prof_name and (self.state_dir / (prof_name + '.json')).exists():
+            self.identity_path = self.state_dir / (prof_name + '.json')
+        elif (self.state_dir / (base_name + '.json')).exists():
+            try:
+                data = json.loads((self.state_dir / (base_name + '.json')).read_text(encoding='utf-8'))
+                if not data.get('profile') or data.get('profile') == profile:
+                    self.identity_path = self.state_dir / (base_name + '.json')
+                else:
+                    self.identity_path = self.state_dir / ((prof_name or base_name) + '.json')
+            except Exception:
+                self.identity_path = self.state_dir / (base_name + '.json')
+        else:
+            self.identity_path = self.state_dir / ((prof_name or base_name) + '.json')
+        if self.identity_path.exists():
+            try:
+                self.identity = json.loads(self.identity_path.read_text(encoding='utf-8'))
+            except Exception:
+                self.identity = {'worker_id': uuid.uuid4().hex}
+        else:
+            self.identity = {'worker_id': uuid.uuid4().hex}
         self.token = self.identity.get('token') or config.get('token', '')
         self.agent_id = self.identity.get('agent_id')
         self.stop = threading.Event()
@@ -216,14 +240,45 @@ class WorkerRuntime:
             return json.load(response)
 
     def save_identity(self):
-        self.identity.update(token=self.token, agent_id=self.agent_id)
+        self.identity.update(token=self.token, agent_id=self.agent_id, profile=self.config.get('profile', ''))
         temporary = self.identity_path.with_suffix('.tmp')
         temporary.write_text(json.dumps(self.identity), encoding='utf-8')
         temporary.chmod(0o600)
         temporary.replace(self.identity_path)
 
     def register(self):
-        result = self.request('POST', '/api/agents/register', {'worker_id': self.identity['worker_id'], 'owner_name': self.config.get('name') or self.machine, 'machine_name': self.machine, 'profile_key': self.config.get('profile','codex-pro'), 'initial_used_pct': float(self.config.get('used_pct',0))})
+        payload = {
+            'worker_id': self.identity['worker_id'],
+            'owner_name': self.config.get('name') or self.machine,
+            'machine_name': self.machine,
+            'profile_key': self.config.get('profile', 'codex-pro'),
+            'initial_used_pct': float(self.config.get('used_pct', 0)),
+        }
+        try:
+            result = self.request('POST', '/api/agents/register', payload)
+        except urllib.error.HTTPError as exc:
+            config_token = self.config.get('token')
+            if exc.code in (401, 403) and config_token and config_token != self.token:
+                self.token = config_token
+                try:
+                    result = self.request('POST', '/api/agents/register', payload)
+                except urllib.error.HTTPError as retry_exc:
+                    if retry_exc.code == 409:
+                        self.identity['worker_id'] = uuid.uuid4().hex
+                        payload['worker_id'] = self.identity['worker_id']
+                        result = self.request('POST', '/api/agents/register', payload)
+                    elif retry_exc.code in (401, 403):
+                        raise RuntimeError('Worker registration failed: invite token expired, revoked, or invalid. Obtain a fresh invite script from the host.') from retry_exc
+                    else:
+                        raise
+            elif exc.code == 409:
+                self.identity['worker_id'] = uuid.uuid4().hex
+                payload['worker_id'] = self.identity['worker_id']
+                result = self.request('POST', '/api/agents/register', payload)
+            elif exc.code in (401, 403):
+                raise RuntimeError('Worker credential revoked or expired. Obtain a new invite script from the host.') from exc
+            else:
+                raise
         self.agent_id = result['id']
         self.token = result.get('worker_token', self.token)
         self.save_identity()
