@@ -1,4 +1,4 @@
-"""FunGuys command-line host, worker, graph and isolated demo commands."""
+"""FunGuys command-line host, worker, graph, MCP bridge, and isolated demo commands."""
 from __future__ import annotations
 import asyncio
 import sys
@@ -8,8 +8,9 @@ import typer
 import uvicorn
 from rich.console import Console
 from funguys.host.app import create_host_app
+from funguys.host.execution import LaptopKeepAwake
 from funguys.host.graph_engine import GraphifyEngine
-from funguys.host.tunnel import start_cloudflare_tunnel, stop_cloudflare_tunnel,get_public_tunnel_url
+from funguys.host.tunnel import start_cloudflare_tunnel, stop_cloudflare_tunnel, get_public_tunnel_url
 from funguys.worker.adapters import detect_available_clis
 from funguys.worker.node import TeammateWorkerNode
 
@@ -19,6 +20,8 @@ console = Console(legacy_windows=False)
 @app.command('host')
 def host_command(port:int=typer.Option(8420,'--port','-p'),host:str=typer.Option('127.0.0.1','--host'),tunnel:bool=typer.Option(False,'--tunnel/--no-tunnel','-t')):
     """Start locally by default; public tunneling is explicit and authenticated."""
+    keep_awake = LaptopKeepAwake()
+    keep_awake.start()
     public_url = None
     if tunnel:
         _,public_url = start_cloudflare_tunnel(port)
@@ -33,16 +36,34 @@ def host_command(port:int=typer.Option(8420,'--port','-p'),host:str=typer.Option
             console.print(f'Public dashboard: {public_url}')
         uvicorn.run(server,host=host,port=port,log_level='info')
     finally:
+        keep_awake.stop()
         if tunnel:
             stop_cloudflare_tunnel()
 
 @app.command('join')
 def join_command(host_url:str,name:str=typer.Option('Teammate','--name','-n'),profile:Optional[str]=typer.Option(None,'--profile','-p'),used_pct:float=typer.Option(0,'--used-pct',min=0,max=100),token:str=typer.Option('', '--token',envvar='FUNGUYS_WORKER_TOKEN'),codename:str=typer.Option('','--codename')):
     """Run a real local CLI worker with a dashboard-issued invite or saved credential."""
-    detected = detect_available_clis()
-    chosen = profile or (detected[0] if detected else 'codex-pro')
-    node = TeammateWorkerNode(host_url,name,chosen,used_pct,token=token,machine_name=codename)
-    asyncio.run(node.listen_forever())
+    keep_awake = LaptopKeepAwake()
+    keep_awake.start()
+    try:
+        detected = detect_available_clis()
+        chosen = profile or (detected[0] if detected else 'claude-opus')
+        node = TeammateWorkerNode(host_url,name,chosen,used_pct,token=token,machine_name=codename)
+        asyncio.run(node.listen_forever())
+    finally:
+        keep_awake.stop()
+
+@app.command('mcp-worker')
+def mcp_worker_command(
+    host_url: str = typer.Option('http://localhost:8420', '--host-url'),
+    token: str = typer.Option('', '--token', envvar='FUNGUYS_WORKER_TOKEN'),
+    name: str = typer.Option('IDE-Agent', '--name', '-n'),
+    profile: str = typer.Option('mcp-ide', '--profile', '-p'),
+    controller: bool = typer.Option(False, '--controller/--no-controller'),
+):
+    """Run a JSON-RPC 2.0 stdio MCP worker so Cursor, Claude Desktop, Windsurf, or VS Code can join the swarm."""
+    from funguys.mcp_bridge.server import run_mcp_stdio_worker
+    run_mcp_stdio_worker(host_url=host_url, token=token, name=name, profile=profile, is_controller=controller)
 
 @app.command('graph')
 def graph_command(workspace:Path=typer.Argument(Path('.')),query:Optional[str]=typer.Option(None,'--query','-q')):

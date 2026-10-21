@@ -31,6 +31,47 @@ class AgentStatus(str, Enum):
     OFFLINE = "offline"
 
 
+class SignalOp(str, Enum):
+    CLAIM = "CLAIM"
+    RELEASE = "RELEASE"
+    FACT = "FACT"
+    TRIPWIRE = "TRIPWIRE"
+    TRIGGER = "TRIGGER"
+    STEER = "STEER"
+    HOLD = "HOLD"
+    GO = "GO"
+    VETO = "VETO"
+
+
+class AgentSignal(BaseModel):
+    id: str = Field(default_factory=lambda: f"sig-{uuid.uuid4().hex[:8]}")
+    sender_agent_id: str
+    op: SignalOp
+    target: str = ""
+    payload: str = ""
+    created_at: str = Field(default_factory=utc_now_iso)
+
+
+class PromptQueueItem(BaseModel):
+    id: str = Field(default_factory=lambda: f"pq-{uuid.uuid4().hex[:8]}")
+    target_agent_id: str
+    sender_agent_id: str
+    mode: Literal["queue", "steer", "interrupt"] = "queue"
+    prompt: str = Field(min_length=1, max_length=4000)
+    priority: int = Field(default=10, ge=0, le=100)
+    delivered: bool = False
+    created_at: str = Field(default_factory=utc_now_iso)
+
+
+class BlackboardEntry(BaseModel):
+    key: str = Field(min_length=1, max_length=256)
+    kind: Literal["fact", "lock", "tripwire"] = "fact"
+    value: str = Field(default="", max_length=1000)
+    agent_id: str = ""
+    task_id: Optional[str] = None
+    updated_at: str = Field(default_factory=utc_now_iso)
+
+
 class ProjectState(BaseModel):
     id: str = "default-project"
     name: str = "Hackathon Project"
@@ -51,10 +92,10 @@ class TaskItem(BaseModel):
     description: str
     phase: int = Field(default=1, ge=1)
     complexity_tier: Literal[1, 2] = 2
-    dependencies: List[str] = Field(default_factory=list,max_length=100)
-    target_files: List[str] = Field(default_factory=list,max_length=100)
+    dependencies: List[str] = Field(default_factory=list, max_length=100)
+    target_files: List[str] = Field(default_factory=list, max_length=100)
     exported_symbols: List[str] = Field(default_factory=list)
-    verification_commands: List[str] = Field(default_factory=list,max_length=20)
+    verification_commands: List[str] = Field(default_factory=list, max_length=20)
     architect_review: Optional[str] = None
     status: TaskStatus = TaskStatus.PENDING
     assigned_agent_id: Optional[str] = None
@@ -82,6 +123,13 @@ class TaskItem(BaseModel):
     execution_failures: int = 0
     require_tests: bool = False
     require_browser: bool = False
+    preferred_agent_id: Optional[str] = None
+    held: bool = False
+    held_by_controller: bool = False
+    hold_reason: Optional[str] = None
+    task_role: Optional[Literal["planning", "important_coding", "gruntwork", "testing"]] = None
+    work_role: Optional[Literal["planning", "important_coding", "gruntwork", "testing"]] = None
+    assigned_model: Optional[str] = None
 
     @field_validator('id')
     @classmethod
@@ -115,9 +163,17 @@ class AgentNode(BaseModel):
     current_task_id: Optional[str] = None
     last_heartbeat: str = Field(default_factory=utc_now_iso)
     worker_id: str = ""
-    executor: Literal['remote', 'local'] = 'remote'
+    executor: Literal['remote', 'local', 'mcp', 'mcp_ide'] = 'remote'
     credential_hash: str = ""
     quota_window_started_at: str = Field(default_factory=utc_now_iso)
+    is_controller: bool = False
+    high_tier_turns_used: int = 0
+    high_tier_turns_limit: int = 25
+    high_tier_used_pct: float = 0.0
+    high_tier_window_started_at: str = Field(default_factory=utc_now_iso)
+    active_model: str = ""
+    active_effort: str = ""
+    active_model_tier: str = ""
 
 
 class ContractAlert(BaseModel):
@@ -176,12 +232,13 @@ class ApprovePlanRequest(BaseModel):
 
 
 class RegisterAgentRequest(BaseModel):
-    owner_name: str = Field(min_length=1,max_length=128)
-    machine_name: str = Field(min_length=1,max_length=128)
+    owner_name: str = Field(min_length=1, max_length=128)
+    machine_name: str = Field(min_length=1, max_length=128)
     profile_key: str = "claude-pro"
     initial_used_pct: float = Field(default=0.0, ge=0, le=100)
     worker_id: str = Field(min_length=8, max_length=128)
-    executor: Literal['remote', 'local'] = 'remote'
+    executor: Literal['remote', 'local', 'mcp', 'mcp_ide'] = 'remote'
+    is_controller: bool = False
 
 
 class ClaimTaskHumanRequest(BaseModel):

@@ -5,6 +5,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -18,7 +19,59 @@ class EnvironmentUnavailable(RuntimeError):
 def run_process(argv, cwd, timeout=60, env=None):
     """Bound capture memory/disk and kill the process group on timeout."""
     from funguys.worker.runtime import capture_process
-    return capture_process(argv,cwd,timeout=timeout,env=env)
+    return capture_process(argv, cwd, timeout=timeout, env=env)
+
+
+ALLOWED_ENV = {
+    'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'PATHEXT', 'LANG',
+    'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TMPDIR',
+    'VIRTUAL_ENV', 'NODE_PATH', 'NPM_CONFIG_CACHE', 'PLAYWRIGHT_BROWSERS_PATH',
+    'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME',
+}
+
+
+class LaptopKeepAwake:
+    """Prevent laptop sleep while FunGuys Host or Worker is active (macOS, Windows, Linux)."""
+
+    def __init__(self) -> None:
+        self._proc = None
+
+    def start(self) -> None:
+        if os.environ.get('FUNGUYS_DISABLE_KEEP_AWAKE') == '1':
+            return
+        try:
+            if sys.platform == 'darwin':
+                caffeinate = shutil.which('caffeinate')
+                if caffeinate:
+                    self._proc = subprocess.Popen(
+                        [caffeinate, '-dimsu', '-w', str(os.getpid())],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+            elif os.name == 'nt':
+                import ctypes
+                # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
+            else:
+                inhibit = shutil.which('systemd-inhibit')
+                if inhibit:
+                    self._proc = subprocess.Popen(
+                        [inhibit, '--what=idle:sleep', '--who=FunGuys', '--why=Swarm active', 'sleep', '36000'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+        except Exception:
+            pass
+
+    def stop(self) -> None:
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+            if os.name == 'nt':
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+        except Exception:
+            pass
 
 
 class SandboxRunner:
@@ -29,8 +82,18 @@ class SandboxRunner:
 
     def run(self, argv, timeout=60):
         if self.trusted:
-            env = {key: value for key, value in os.environ.items() if key.upper() in {
-                'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'PATHEXT', 'LANG'}}
+            env = {key: value for key, value in os.environ.items() if key.upper() in ALLOWED_ENV}
+            extra_paths = [
+                '/opt/homebrew/bin',
+                '/usr/local/bin',
+                str(Path.home() / '.local' / 'bin'),
+            ]
+            current_path = env.get('PATH', '')
+            for p in extra_paths:
+                if os.path.isdir(p) and p not in current_path:
+                    current_path = f"{current_path}{os.pathsep}{p}" if current_path else p
+            if current_path:
+                env['PATH'] = current_path
             env['PYTHONPATH'] = str(self.workspace)
             return run_process(argv, self.workspace, timeout, env)
         docker = shutil.which('docker')

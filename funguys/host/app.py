@@ -13,9 +13,9 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-from funguys.config import SUBSCRIPTION_PROFILES
+from funguys.config import PLANNER_PROVIDER_PRIORITY, SUBSCRIPTION_PROFILES, resolve_profile_key
 from funguys.db import StateStore
-from funguys.files import bundle, source_files, validate_dag,runtime_directory
+from funguys.files import bundle, source_files, validate_dag, runtime_directory
 from funguys.host.orchestrator import FunGuysOrchestrator, ConflictError
 from funguys.host.security import AccessControl
 from funguys.host.tunnel import get_lan_ip
@@ -33,6 +33,22 @@ class SubmitTaskRequest(BaseModel):
     submission_id: str = Field(min_length=8, max_length=128)
     commit_message: str = Field(default='Complete task', max_length=500)
     used_pct_after: Optional[float] = Field(default=None, ge=0, le=100)
+    raw_output: Optional[str] = Field(default=None, max_length=20000)
+
+class SignalItemRequest(BaseModel):
+    op: str
+    target: str
+    payload: str = ''
+
+class ControllerSignalRequest(BaseModel):
+    sender_agent_id: Optional[str] = None
+    signals: list[SignalItemRequest] = Field(default_factory=list, max_length=50)
+
+class SteerAgentRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+    mode: Literal['queue', 'steer', 'interrupt'] = 'steer'
+    task_id: Optional[str] = None
+    sender_agent_id: str = 'controller'
 
 class StartGrillRequest(BaseModel):
     project_name: str
@@ -48,6 +64,8 @@ class CreateTaskRequest(BaseModel):
     description: str = Field(min_length=1,max_length=20000)
     phase: int = Field(default=1,ge=1)
     complexity_tier: Literal[1,2] = 2
+    task_role: Optional[Literal['planning','important_coding','gruntwork','testing']] = None
+    work_role: Optional[Literal['planning','important_coding','gruntwork','testing']] = None
     dependencies: list[str] = Field(default_factory=list)
     target_files: list[str] = Field(default_factory=list)
     verification_commands: list[str] = Field(default_factory=list)
@@ -100,7 +118,7 @@ class BodyLimit:
                 return
             size += len(message.get('body', b''))
             if size > limit:
-                return await JSONResponse({'detail':'Request exceeds 30 MB limit'}, status_code=413)(scope, receive, send)
+                return await JSONResponse({'detail':'Request exceeds 80 MB limit'}, status_code=413)(scope, receive, send)
             chunks.append(message)
             if not message.get('more_body'):
                 break
@@ -125,6 +143,7 @@ def create_host_app(base_dir: Optional[Path] = None, *, admin_token=None, public
 
 def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_provider,host_lock):
     from funguys.host.architect import GrillArchitectEngine, GrillSession
+    from funguys.host.execution import LaptopKeepAwake
     root = (base_dir or Path.cwd()).resolve()
     state_dir = runtime_directory(root,'.funguys')
     store = StateStore(state_dir / 'state.db')
@@ -149,6 +168,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
     plan_lock, enroll_lock = asyncio.Lock(), asyncio.Lock()
     state_counter = itertools.count()
     host_instance = secrets.token_hex(12)
+    keep_awake = LaptopKeepAwake()
 
     async def project_mutation():
         if plan_lock.locked():
@@ -179,6 +199,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
     @asynccontextmanager
     async def lifespan(app):
         host_lock.acquire()
+        keep_awake.start()
         tasks = [asyncio.create_task(maintenance()), asyncio.create_task(local_execution())]
         try:
             yield
@@ -191,8 +212,9 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
                 await asyncio.gather(*tasks,return_exceptions=True)
                 await asyncio.gather(*(asyncio.wait_for(ws.close(),timeout=2) for ws in list(clients)),return_exceptions=True)
             finally:
+                keep_awake.stop()
                 host_lock.release()
-    app = FastAPI(title='FunGuys Host', version='0.2.0', lifespan=lifespan)
+    app = FastAPI(title='FunGuys Host', version='0.3.0', lifespan=lifespan)
     app.add_middleware(BodyLimit)
     app.state.store, app.state.orchestrator, app.state.grill_engine = store, orch, grill
     app.state.host_lock = host_lock
@@ -225,7 +247,19 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
             if not identity:
                 return JSONResponse({'detail':'Sign in or supply a worker credential'}, status_code=401)
             if identity['role'] != 'admin':
-                permitted = (path == '/api/agents/register' and identity['role'] in ('invite','worker')) or (identity['role'] == 'worker' and (path in ('/api/worker/assignment','/api/workspace/snapshot') or path.startswith('/api/tasks/') and path.endswith(('/submit','/execution-failed')) or path == f"/api/agents/{identity['agent_id']}/heartbeat" or path == f"/api/agents/{identity['agent_id']}/quota"))
+                permitted = (
+                    (path == '/api/agents/register' and identity['role'] in ('invite', 'worker'))
+                    or (
+                        identity['role'] == 'worker'
+                        and (
+                            path in ('/api/worker/assignment', '/api/workspace/snapshot', '/api/controller/signal', '/api/blackboard')
+                            or (path.startswith('/api/tasks/') and path.endswith(('/submit', '/execution-failed')))
+                            or (path.startswith('/api/agents/') and path.endswith('/steer'))
+                            or path == f"/api/agents/{identity['agent_id']}/heartbeat"
+                            or path == f"/api/agents/{identity['agent_id']}/quota"
+                        )
+                    )
+                )
                 if not permitted:
                     return JSONResponse({'detail':'Administrator access required'}, status_code=403)
         response = await call_next(request)
@@ -237,7 +271,28 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
 
     def state():
         project = store.get_project()
-        return {'host_instance':host_instance,'state_sequence':next(state_counter),'project':project.model_dump(), 'tasks':[orch.public_task(t) for t in store.list_tasks()], 'agents':[orch.public_agent(a) for a in store.list_agents()], 'qa_reports':[r.model_dump() for r in store.list_qa_reports() if r.project_id==project.id], 'contract_alerts':[a.model_dump() for a in store.list_contract_alerts() if a.project_id==project.id], 'events':[e.model_dump() for e in store.list_events()], 'chat_history':[c for c in store.list_chat() if c.get('project_id')==project.id], 'graph':orch.graph.last_graph_data, 'graph_report_markdown':'', 'grill':grill.session.model_dump(), 'lan_ip':app.state.lan_ip, 'listen_host':bind_host, 'public_url':app.state.public_url, 'available_workspaces':[{'path':str(p), 'folder_name':p.name, 'project_name':p.name} for p in sorted((state_dir/'workspaces').iterdir()) if p.is_dir()], 'profiles':{key:{'provider':p.provider,'display_name':p.display_name,'tier':p.tier} for key,p in SUBSCRIPTION_PROFILES.items()}, 'btw': orch.get_btw_session()}
+        return {
+            'host_instance':host_instance,
+            'state_sequence':next(state_counter),
+            'project':project.model_dump(),
+            'tasks':[orch.public_task(t) for t in store.list_tasks()],
+            'agents':[orch.public_agent(a) for a in store.list_agents()],
+            'qa_reports':[r.model_dump() for r in store.list_qa_reports() if r.project_id==project.id],
+            'contract_alerts':[a.model_dump() for a in store.list_contract_alerts() if a.project_id==project.id],
+            'events':[e.model_dump() for e in store.list_events()],
+            'chat_history':[c for c in store.list_chat() if c.get('project_id')==project.id],
+            'blackboard':[b.model_dump() for b in store.list_blackboard(limit=40)],
+            'prompt_queue':[p.model_dump() for p in store.list_prompts(limit=30)],
+            'graph':orch.graph.last_graph_data,
+            'graph_report_markdown':'',
+            'grill':grill.session.model_dump(),
+            'lan_ip':app.state.lan_ip,
+            'listen_host':bind_host,
+            'public_url':app.state.public_url,
+            'available_workspaces':[{'path':str(p), 'folder_name':p.name, 'project_name':p.name} for p in sorted((state_dir/'workspaces').iterdir()) if p.is_dir()],
+            'profiles':{key:{'provider':p.provider,'display_name':p.display_name,'tier':p.tier} for key,p in SUBSCRIPTION_PROFILES.items()},
+            'btw': orch.get_btw_session(),
+        }
 
     async def sync():
         await broadcast({'type':'state_sync', 'state':state()})
@@ -274,7 +329,10 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         import sys, os, subprocess
         async def do_restart():
             await asyncio.sleep(0.5)
-            # Spawn a new host process using the same python interpreter and arguments
+            try:
+                host_lock.release()
+            except Exception:
+                pass
             args = [sys.executable, '-m', 'funguys.cli', 'host']
             env = os.environ.copy()
             env['FUNGUYS_TRUSTED_EXECUTION'] = '1'
@@ -293,8 +351,8 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
             identity = access.identify(request.state.token)
             if not identity:
                 raise HTTPException(401,'Invite expired or revoked')
-            if identity['role'] != 'admin' and req.executor != 'remote':
-                raise HTTPException(403,'Only the administrator can register a host executor')
+            if identity['role'] != 'admin' and req.executor == 'local':
+                raise HTTPException(403,'Only the administrator can register a local host executor')
             existing_id = identity['agent_id'] if identity['role']=='worker' else None
             if existing_id:
                 existing = store.get_agent(existing_id)
@@ -304,7 +362,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
             result = orch.public_agent(agent)
             if identity['role'] == 'invite':
                 result['worker_token'] = access.enroll(request.state.token, agent.id)
-            elif identity['role'] == 'admin' and req.executor == 'remote':
+            elif identity['role'] == 'admin' and req.executor in ('remote', 'mcp', 'mcp_ide'):
                 from funguys.host.security import digest
                 worker_token = secrets.token_urlsafe(32)
                 store.save_credential(digest(worker_token),'worker',agent.id)
@@ -336,6 +394,45 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         await sync()
         return result
 
+    @app.post('/api/agents/{agent_id}/controller')
+    async def set_controller(agent_id:str):
+        agent = await orch.designate_controller(agent_id)
+        await sync()
+        return orch.public_agent(agent)
+
+    @app.post('/api/agents/{agent_id}/steer')
+    async def steer_agent(agent_id:str, req:SteerAgentRequest, request:Request):
+        sender = req.sender_agent_id
+        if request.state.identity['role'] == 'worker':
+            sender = request.state.identity['agent_id']
+        result = await orch.steer_or_trigger_agent(
+            target_agent_id=agent_id,
+            prompt=req.prompt,
+            mode=req.mode,
+            task_id=req.task_id,
+            sender_agent_id=sender,
+        )
+        await sync()
+        return result
+
+    @app.post('/api/controller/signal')
+    async def controller_signal(req:ControllerSignalRequest, request:Request):
+        sender = req.sender_agent_id or 'controller'
+        if request.state.identity['role'] == 'worker':
+            sender = request.state.identity['agent_id']
+        result = await orch.process_signals(sender, [s.model_dump() for s in req.signals])
+        await sync()
+        return {'processed': result}
+
+    @app.get('/api/blackboard')
+    async def get_blackboard():
+        return {'blackboard': [b.model_dump() for b in store.list_blackboard(limit=50)]}
+
+    @app.post('/api/git-c2/sync')
+    async def git_c2_sync():
+        ok = await asyncio.to_thread(orch.git_c2.push_checkpoint, store.snapshot())
+        return {'pushed': ok}
+
     @app.delete('/api/agents/{agent_id}')
     async def delete_agent(agent_id:str):
         await orch.delete_agent(agent_id)
@@ -350,7 +447,8 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
                 raise HTTPException(404,'Agent not found')
             agent.machine_name = (req.get('codename') or agent.machine_name).strip()
             agent.owner_name = (req.get('owner_name') or agent.owner_name).strip()
-            agent.display_name = f'{agent.owner_name}: {SUBSCRIPTION_PROFILES[agent.profile_key].display_name}'
+            prof = SUBSCRIPTION_PROFILES.get(resolve_profile_key(agent.profile_key)) or SUBSCRIPTION_PROFILES['chatgpt-astra-sol']
+            agent.display_name = f'{agent.owner_name}: {prof.display_name}'
             store.save_agent(agent)
         await sync()
         return orch.public_agent(agent)
@@ -453,7 +551,16 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
 
     def select_architect(agent_id):
         agents = store.list_agents()
-        selected = next((a for a in agents if a.id==agent_id),None) if agent_id else min((a for a in agents if a.executor=='local' and a.status.value=='idle'),key=lambda a:a.tier,default=None)
+        # Planning priority: 1st Claude (Opus High) -> 2nd Gemini (Argon Med) -> 3rd OpenAI (Astra Low)
+        selected = (
+            next((a for a in agents if a.id == agent_id), None)
+            if agent_id
+            else min(
+                (a for a in agents if a.executor == 'local' and a.status.value == 'idle' and a.id not in orch._consulting_agents),
+                key=lambda a: (not a.is_controller, PLANNER_PROVIDER_PRIORITY.get(a.provider, 9), a.high_tier_used_pct, a.tier),
+                default=None,
+            )
+        )
         if not selected or selected.executor!='local' or selected.status.value!='idle' or selected.id in orch._consulting_agents:
             raise ConflictError('Choose an idle local architect. Remote nodes currently execute coding assignments; another provider will not be substituted.')
         grill.provider = selected.provider
@@ -475,9 +582,6 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
                 except asyncio.CancelledError:
                     if job.cancelled():
                         raise
-                    # Finish the authorized, bounded draft operation despite an HTTP
-                    # disconnect. Keep ownership until its result is installed, so
-                    # an abandoned compile cannot leave a drafted-but-missing plan.
                     continue
             persist_grill()
             return result
@@ -605,7 +709,6 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
     async def worker_source():
         from fastapi import Response
         path = Path(__file__).parent.parent/'worker'/'runtime.py'
-        # Serve LF-normalized bytes to guarantee exact hash match across Windows and Linux
         content = path.read_bytes().replace(b'\r\n', b'\n')
         return Response(content=content, media_type='text/plain; charset=utf-8')
 
@@ -613,12 +716,12 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         identity = access.identify(token)
         if not identity or identity['role'] != 'invite':
             raise HTTPException(401,'A current invitation is required')
-        if profile not in SUBSCRIPTION_PROFILES:
+        canonical_profile = resolve_profile_key(profile)
+        if canonical_profile not in SUBSCRIPTION_PROFILES:
             raise ValueError('Unknown profile')
         request_base = str(request.base_url).rstrip('/')
-        # Use request's actual host URL if accessed locally/LAN, fallback to public_url only if request came via tunnel
         host_url = request_base if not app.state.public_url or any(h in request_base for h in ('localhost', '127.0.0.1', app.state.lan_ip)) else app.state.public_url
-        return {'host_url':host_url, 'token':token, 'name':name, 'codename':codename, 'profile':profile, 'used_pct':used_pct}
+        return {'host_url':host_url, 'token':token, 'name':name, 'codename':codename, 'profile':canonical_profile, 'used_pct':used_pct}
 
     @app.get('/join.ps1',response_class=PlainTextResponse)
     async def join_ps(request:Request,token:str='',name:str='Teammate',codename:str='',profile:str='codex-pro',used_pct:float=0):

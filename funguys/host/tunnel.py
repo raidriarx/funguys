@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import socket
@@ -32,6 +33,14 @@ def get_lan_ip() -> str:
                     parts = snic.address.split(".")
                     if len(parts) == 4 and 64 <= int(parts[1]) <= 127:
                         return snic.address
+    except Exception:
+        pass
+
+    try:
+        cmd = ["ipconfig"] if os.name == "nt" else ["ifconfig"]
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=3)
+        for match in re.finditer(r"\b(100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3})\b", out):
+            return match.group(1)
     except Exception:
         pass
 

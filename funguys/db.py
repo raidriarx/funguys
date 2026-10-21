@@ -11,8 +11,10 @@ from typing import Dict, List, Optional
 from funguys.models import (
     ActivityEvent,
     AgentNode,
+    BlackboardEntry,
     ContractAlert,
     ProjectState,
+    PromptQueueItem,
     QARunReport,
     TaskItem,
 )
@@ -76,6 +78,20 @@ class StateStore:
                 );
                 CREATE TABLE IF NOT EXISTS chat (
                     id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS prompt_queue (
+                    id TEXT PRIMARY KEY,
+                    target_agent_id TEXT NOT NULL,
+                    delivered INTEGER NOT NULL DEFAULT 0,
+                    priority INTEGER NOT NULL DEFAULT 10,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS blackboard (
+                    key TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
                     payload TEXT NOT NULL
                 );
                 """
@@ -191,6 +207,8 @@ class StateStore:
             "contract_alerts": self.list_contract_alerts(limit=30),
             "qa_reports": self.list_qa_reports(limit=30),
             "events": self.list_events(limit=60),
+            "blackboard": self.list_blackboard(limit=40),
+            "prompt_queue": self.list_prompts(limit=30),
         }
 
     def replace_tasks(self, tasks, project=None):
@@ -227,3 +245,64 @@ class StateStore:
     def clear_chat(self):
         with self._connect() as conn:
             conn.execute('DELETE FROM chat')
+
+    def enqueue_prompt(self, item: PromptQueueItem) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO prompt_queue (id, target_agent_id, delivered, priority, created_at, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (item.id, item.target_agent_id, int(item.delivered), item.priority, item.created_at, item.model_dump_json()),
+            )
+
+    def pop_pending_prompts(self, target_agent_id: str) -> List[PromptQueueItem]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, payload FROM prompt_queue WHERE target_agent_id = ? AND delivered = 0 ORDER BY priority DESC, created_at ASC",
+                (target_agent_id,),
+            ).fetchall()
+            items: List[PromptQueueItem] = []
+            for row in rows:
+                item = PromptQueueItem.model_validate_json(row["payload"])
+                item.delivered = True
+                items.append(item)
+                conn.execute(
+                    "UPDATE prompt_queue SET delivered = 1, payload = ? WHERE id = ?",
+                    (item.model_dump_json(), row["id"]),
+                )
+            return items
+
+    def list_prompts(self, limit: int = 40) -> List[PromptQueueItem]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM prompt_queue ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [PromptQueueItem.model_validate_json(r["payload"]) for r in rows]
+
+    def put_blackboard(self, entry: BlackboardEntry) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO blackboard (key, kind, updated_at, payload) VALUES (?, ?, ?, ?)",
+                (entry.key, entry.kind, entry.updated_at, entry.model_dump_json()),
+            )
+
+    def remove_blackboard_locks(self, agent_id: str, key: Optional[str] = None) -> None:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT key, payload FROM blackboard WHERE kind = 'lock'").fetchall()
+            for row in rows:
+                entry = BlackboardEntry.model_validate_json(row["payload"])
+                if entry.agent_id == agent_id and (key is None or entry.key == key):
+                    conn.execute("DELETE FROM blackboard WHERE key = ?", (row["key"],))
+
+    def list_blackboard(self, kind: Optional[str] = None, limit: int = 50) -> List[BlackboardEntry]:
+        with self._connect() as conn:
+            if kind:
+                rows = conn.execute(
+                    "SELECT payload FROM blackboard WHERE kind = ? ORDER BY updated_at DESC LIMIT ?",
+                    (kind, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT payload FROM blackboard ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [BlackboardEntry.model_validate_json(r["payload"]) for r in rows]

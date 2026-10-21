@@ -19,7 +19,7 @@
 <script src="/dashboard.js" defer></script>
 </head>
 <body>
-<header><div><h1>FUNGUYS // MISSION CONTROL</h1><p class="muted">Collaborative engineering · reviewed plans · verified changes</p></div><div class="row"><span id="connection" class="warn">CONNECTING</span><button id="restart-host" title="Restart Host Process">Restart Host</button><button id="sign-out" hidden>Sign out</button></div></header>
+<header><div><h1>FUNGUYS // MISSION CONTROL</h1><p class="muted">Collaborative engineering · Main Controller C2 · token-efficient swarm</p></div><div class="row"><span id="connection" class="warn">CONNECTING</span><button id="restart-host" title="Restart Host Process">Restart Host</button><button id="sign-out" hidden>Sign out</button></div></header>
 <div id="error" class="notice bad" role="alert" hidden></div><div id="busy" role="status" hidden>Working…</div>
 <section id="login"><h2>Administrator sign in</h2><p>Use the token saved in <code>.funguys/admin_token</code> on the host machine. Workers connect through the invitation commands.</p><form id="login-form"><label for="login-token">Administrator token</label><input id="login-token" type="password" required autocomplete="current-password"><p><button class="primary">Sign in</button></p></form></section>
 <main id="app" hidden>
@@ -78,10 +78,10 @@
         <input id="task-files" required>
         <label for="task-deps">Dependencies (comma separated task IDs)</label>
         <input id="task-deps">
-        <label for="task-tier">Required tier</label>
+        <label for="task-tier">Required tier / Work Importance</label>
         <select id="task-tier">
-          <option value="1">1 — Architecture / complex work</option>
-          <option value="2" selected>2 — Builder / tests</option>
+          <option value="1">1 — Important Coding / Core Architecture (Opus High / Argon Low / Sol High)</option>
+          <option value="2" selected>2 — Gruntwork / Tests (Flash High / Sol High / Opus Medium)</option>
         </select>
         <label for="task-verify">Verification commands (one per line)</label>
         <textarea id="task-verify"></textarea>
@@ -94,7 +94,7 @@
 
   <section>
     <h2>Plan interview</h2>
-    <p class="muted">Choose an idle local architect. Answers never approve or execute a plan automatically.</p>
+    <p class="muted">Default planning priority: Claude Opus High → Gemini Argon Medium → OpenAI Astra Low. Answers never approve or execute a plan automatically.</p>
     <form id="grill-form">
       <div class="columns">
         <div>
@@ -135,7 +135,7 @@
 
   <div class="columns">
     <section>
-      <h2>Project questions</h2>
+      <h2>Project questions & Main Controller Steering</h2>
       <div id="btw-banner" style="display:none;background:#0d1c14;border:1px solid #4a9;padding:12px;margin-bottom:12px">
         <div class="row" style="justify-content:space-between">
           <div>
@@ -156,7 +156,8 @@
       <div id="chat"></div>
     </section>
     <section>
-      <h2>Knowledge graph & documentation</h2>
+      <h2>Knowledge graph & Shared C2 Blackboard</h2>
+      <div id="blackboard-list" style="margin-bottom:14px"></div>
       <form id="graph-form">
         <label for="graph-mode">Graph tool</label>
         <select id="graph-mode"><option value="query">Query</option><option value="explain">Explain</option><option value="path">Path</option></select>
@@ -200,7 +201,7 @@
   <div id="workers-container">
     <div id="invite-columns" class="columns">
       <section>
-        <h2>Worker nodes</h2>
+        <h2>Worker nodes & Main Controller</h2>
         <div id="agents"></div>
         <details>
           <summary>Register a local host executor</summary>
@@ -215,8 +216,8 @@
         </details>
       </section>
       <section>
-        <h2>Invite a worker</h2>
-        <p class="muted">Requires Python 3.11+ and the selected AI CLI on the worker. No repository or FunGuys package installation is needed. Invitations expire in one hour and enroll one machine.</p>
+        <h2>Invite a worker (CLI or IDE MCP)</h2>
+        <p class="muted">Requires Python 3.11+ and the selected AI CLI or IDE MCP client. No repository installation is needed for remote CLI workers. Invitations expire in one hour and enroll one machine.</p>
         <form id="invite-form">
           <label for="invite-target">Connection type</label>
           <select id="invite-target"></select>
@@ -235,6 +236,9 @@
           <label for="bash-command">Mac / Linux Bash</label>
           <textarea id="bash-command" class="commands" readonly></textarea>
           <button data-copy="bash-command">Copy Bash command</button>
+          <label for="mcp-command">IDE / Desktop MCP Config (Cursor / Claude Desktop / Windsurf)</label>
+          <textarea id="mcp-command" class="commands" readonly></textarea>
+          <button data-copy="mcp-command">Copy MCP JSON</button>
           <p id="invite-expiry" class="muted"></p>
         </div>
       </section>

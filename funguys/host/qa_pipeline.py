@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import os
 import shlex
 import sys
 import uuid
@@ -174,6 +175,13 @@ class AutonomousQAPipeline:
         return True, '\n'.join(logs), False
 
     async def _run_playwright_check(self, task, attempt, live_preview_url):
+        has_frontend_target = any(
+            Path(f).suffix.lower() in ('.html', '.htm', '.jsx', '.tsx', '.vue', '.svelte', '.css')
+            or 'frontend' in f.lower()
+            for f in (task.target_files or [])
+        )
+        if not live_preview_url and not task.require_browser and not has_frontend_target:
+            return True, 'SKIPPED: backend/non-UI task does not require headless browser launch', None
         html = sorted([p for p in source_files(self.workspace_path) if p.suffix == '.html'], key=lambda p: (p.name != 'index.html', str(p)))
         if not live_preview_url and not html:
             return (False, 'Required browser target is missing', None) if task.require_browser else (True, 'SKIPPED: no browser target for this task', None)

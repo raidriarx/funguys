@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from funguys.models import TaskItem, TaskStatus
+from funguys.protocol import classify_task_role
 
 
 class GrillQuestion(BaseModel):
@@ -57,7 +58,7 @@ class GrillArchitectEngine:
 
     def __init__(self) -> None:
         self.session = GrillSession()
-        self.provider = "codex"
+        self.provider = "claude"
 
     def _update_phase(
         self,
@@ -132,7 +133,10 @@ class GrillArchitectEngine:
         self._update_phase("HEAD_BOT_THINKING", f"Consulting selected {self.provider} provider", progress_cb)
         raw = None
         try:
-            raw = run_text_agent(self.provider, prompt + "\nReturn only the requested JSON object. Do not call tools.", timeout_sec)
+            try:
+                raw = run_text_agent(self.provider, prompt + "\nReturn only the requested JSON object. Do not call tools.", timeout_sec, role="planning")
+            except TypeError:
+                raw = run_text_agent(self.provider, prompt + "\nReturn only the requested JSON object. Do not call tools.", timeout_sec)
             log.log('architect_response', f'{self.provider} answered', provider=self.provider, timeout_sec=timeout_sec, prompt=prompt, raw=raw)
             decoder = json.JSONDecoder()
             for start, character in enumerate(raw):
@@ -327,8 +331,10 @@ class GrillArchitectEngine:
             f"{existing_context_prompt}\n"
             f"Requirements:\n"
             f"1. Do NOT use toy templates. Design the REAL files, modules, and architecture required for '{name}' (whether Web3, local macro/bot, game, CLI, or full-stack).\n"
-            f"2. Generate between 3 and 6 tasks organized into sequential phases (`phase`: 1, 2, 3...) with accurate `dependencies`, `complexity_tier` (1 for core engine/architecture, 2 for UI/tests/packaging), `target_files`, `exported_symbols`, and `verification_commands`.\n"
-            f"3. Return ONLY valid JSON matching this schema:\n"
+            f"2. Generate between 3 and 6 tasks organized into sequential phases (`phase`: 1, 2, 3...) with accurate `dependencies`, `complexity_tier` (1 for important architectural/core work, 2 for gruntwork/boilerplate/tests), `task_role` / `work_role` ('important_coding', 'gruntwork', or 'testing'), `target_files`, `exported_symbols`, and `verification_commands`.\n"
+            f"3. Route by work importance, NOT by token volume: if a task is large/token-heavy but architecturally critical, set `complexity_tier`: 1 and `work_role`: 'important_coding' so Argon Low / Opus High handles it; set `complexity_tier`: 2 and `work_role`: 'gruntwork' (or 'testing') for Flash High / Sol High / Opus Medium.\n"
+            f"4. Parse out work so Argon / Opus High usage pools do not run out easily: split large features into a slim `important_coding` core-logic task and separate `gruntwork` (boilerplate/wiring) and `testing` tasks.\n"
+            f"5. Return ONLY valid JSON matching this schema:\n"
             f'{{\n'
             f'  "contracts_markdown": "# CONTRACTS.md — {name}\\n\\n(Architecture specification, module boundaries, agreed interface contracts, and how to run)",\n'
             f'  "tasks": [\n'
@@ -338,6 +344,8 @@ class GrillArchitectEngine:
             f'      "description": "...",\n'
             f'      "phase": 1,\n'
             f'      "complexity_tier": 1,\n'
+            f'      "task_role": "important_coding",\n'
+            f'      "work_role": "important_coding",\n'
             f'      "dependencies": [],\n'
             f'      "target_files": ["src/..."],\n'
             f'      "exported_symbols": ["..."],\n'
@@ -370,6 +378,9 @@ class GrillArchitectEngine:
                     tier = 1 if int(raw_t.get("complexity_tier") or (1 if idx == 0 else 2)) <= 1 else 2
                 except (TypeError, ValueError):
                     tier = 2
+                raw_role = str(raw_t.get("task_role") or raw_t.get("work_role") or "").strip().lower()
+                if raw_role not in ("important_coding", "gruntwork", "testing"):
+                    raw_role = classify_task_role(raw_t)
                 tasks.append(
                     TaskItem(
                         id=tid,
@@ -377,11 +388,13 @@ class GrillArchitectEngine:
                         description=str(raw_t.get("description") or idea),
                         phase=max(1, int(raw_t.get("phase") or (1 if not deps else 2))),
                         complexity_tier=tier,
+                        task_role=raw_role,
+                        work_role=raw_role,
                         dependencies=deps,
                         target_files=[str(f) for f in (raw_t.get("target_files") or [f"module_{idx+1}.py"])],
                         exported_symbols=[str(s) for s in (raw_t.get("exported_symbols") or [])],
                         verification_commands=[str(c) for c in (raw_t.get("verification_commands") or [])],
-                        require_tests=bool(raw_t.get("require_tests", False)),
+                        require_tests=bool(raw_t.get("require_tests", False) or raw_role == "testing"),
                         require_browser=bool(raw_t.get("require_browser", False)),
                         status=TaskStatus.READY if not deps else TaskStatus.PENDING,
                         branch_name=f"task/{tid}",

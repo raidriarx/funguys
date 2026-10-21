@@ -3,52 +3,77 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import Any,Dict
-from funguys.worker.runtime import execute_cli, collect_changes, task_prompt, cli_command
+from typing import Any, Dict
+from funguys.worker.runtime import (
+    cli_command,
+    collect_changes,
+    execute_cli,
+    resolve_cli_binary,
+    select_model_and_effort,
+    task_prompt,
+)
 from funguys.host.execution import run_process
 
+
 def detect_available_clis():
-    import shutil
+    # Ordered by planning usage rate priority:
+    # 1st: Claude (Opus High) -> 2nd: Gemini (Argon Medium) -> 3rd: Codex/OpenAI (Astra Low)
     profiles = []
-    if shutil.which('claude'):
-        profiles.append('claude-pro')
-    if shutil.which('gemini') or shutil.which('agy'):
-        profiles.append('gemini-cli')
-    if shutil.which('codex'):
-        profiles.append('codex-pro')
+    if resolve_cli_binary('claude'):
+        profiles.append('claude-opus')
+    if resolve_cli_binary('gemini'):
+        profiles.append('gemini-argon-flash')
+    if resolve_cli_binary('codex'):
+        profiles.append('chatgpt-astra-sol')
     return profiles
 
-def build_graphify_task_prompt(task, contracts_markdown, subgraph_digest):
-    return task_prompt({'task':task, 'contracts_markdown':contracts_markdown, 'subgraph_digest':subgraph_digest})
 
-def run_cli_agent_task(provider, work_dir, prompt, target_files, timeout_sec=240, cancelled=None):
+def build_graphify_task_prompt(task, contracts_markdown, subgraph_digest):
+    return task_prompt({'task': task, 'contracts_markdown': contracts_markdown, 'subgraph_digest': subgraph_digest})
+
+
+def run_cli_agent_task(provider, work_dir, prompt, target_files, timeout_sec=240, cancelled=None, model=None, effort=None):
     if os.environ.get('FUNGUYS_TRUSTED_EXECUTION') != '1':
         return False, False, {}, 'Host CLI execution is disabled. Use a remote worker or explicitly enable FUNGUYS_TRUSTED_EXECUTION=1 for trusted local projects.'
     try:
-        ok, limited, output = execute_cli(provider, work_dir, prompt, cancelled=cancelled, timeout=timeout_sec)
+        ok, limited, output = execute_cli(provider, work_dir, prompt, cancelled=cancelled, timeout=timeout_sec, model=model, effort=effort)
         return ok, limited, {}, output
     except Exception as exc:
         return False, False, {}, str(exc)
 
-def run_text_agent(provider, prompt, timeout=90):
-    if len(prompt) > 6000:
-        prompt = prompt[:3000] + '\n\n[... truncated for process buffer safety ...]\n\n' + prompt[-3000:]
+
+def run_text_agent(provider, prompt, timeout=90, role='planning'):
+    if len(prompt) > 16000:
+        prompt = prompt[:6000] + '\n\n[... middle context compressed ...]\n\n' + prompt[-9000:]
+    model, effort = select_model_and_effort(provider, role=role, high_tier_exhausted=False)
     with tempfile.TemporaryDirectory(prefix='funguys-consult-') as directory:
         root = Path(directory)
-        command = cli_command(provider, root, prompt)
+        command = cli_command(provider, root, prompt, model=model, effort=effort)
         output = root / 'answer.txt'
         if provider == 'codex':
             command = [arg if arg != 'workspace-write' else 'read-only' for arg in command]
             command[-1:-1] = ['--ephemeral', '--output-last-message', str(output)]
         elif provider == 'claude':
-            command[command.index('--tools') + 1] = ''
+            if '--tools' in command:
+                idx = command.index('--tools')
+                del command[idx:idx + 2]
         code, text = run_process(command, root, timeout)
+        if code and (model or effort):
+            fallback_cmd = cli_command(provider, root, prompt)
+            if provider == 'codex':
+                fallback_cmd = [arg if arg != 'workspace-write' else 'read-only' for arg in fallback_cmd]
+                fallback_cmd[-1:-1] = ['--ephemeral', '--output-last-message', str(output)]
+            elif provider == 'claude' and '--tools' in fallback_cmd:
+                idx = fallback_cmd.index('--tools')
+                del fallback_cmd[idx:idx + 2]
+            code, text = run_process(fallback_cmd, root, timeout)
         if code:
             raise RuntimeError(f'{provider} consultation failed: {text[-2000:]}')
         answer = output.read_text(encoding='utf-8') if output.exists() else text
         if not answer.strip():
             raise RuntimeError('Selected provider returned an empty answer')
         return answer.strip()
+
 
 def generate_task_code_artifact(
     task: Dict[str, Any],

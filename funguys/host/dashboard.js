@@ -95,9 +95,6 @@ function render(data) {
   if ($('nav-worker-count')) $('nav-worker-count').textContent = String(workerCount);
   if ($('worker-summary-count')) $('worker-summary-count').textContent = String(workerCount);
 
-  // Position invite worker section:
-  // If no worker nodes exist, place the invite interface at the top of the project screen so it is seen first.
-  // Otherwise, place it inside the dedicated workers screen.
   const inviteColumns = $('invite-columns');
   const zeroWorkersContainer = $('zero-workers-container');
   const workersContainer = $('workers-container');
@@ -127,11 +124,11 @@ function render(data) {
   }
   fillSelect('invite-target', targets, targets[0][0]);
   const profiles=Object.entries(data.profiles).filter(([,p]) => p.provider!=='api').map(([key,p]) => [key,`${p.display_name} · Tier ${p.tier}`]);
-  fillSelect('invite-profile',profiles,'codex-pro'); fillSelect('local-profile',profiles,'codex-pro');
-  const locals=data.agents.filter(a => a.executor==='local').map(a => [a.id,`${a.machine_name} · ${a.display_name} · ${a.status}`]);
-  fillSelect('grill-agent',[['','Auto: idle local architect'],...locals]);
-  const allAgents=data.agents.map(a => [a.id,`${a.machine_name} (${a.display_name}) · ${a.status.toUpperCase()} [${a.executor}]`]);
-  fillSelect('chat-agent',[['auto','Auto: best available agent'],...allAgents]);
+  fillSelect('invite-profile',profiles,'claude-opus'); fillSelect('local-profile',profiles,'claude-opus');
+  const locals=data.agents.filter(a => a.executor==='local').map(a => [a.id,`${a.is_controller?'👑 ':''}${a.machine_name} · ${a.display_name} · ${a.status}`]);
+  fillSelect('grill-agent',[['','Auto: Claude Opus High → Argon Med → Astra Low'],...locals]);
+  const allAgents=data.agents.map(a => [a.id,`${a.is_controller?'👑 [CONTROLLER] ':''}${a.machine_name} (${a.display_name}) · ${a.status.toUpperCase()} [${a.executor}]`]);
+  fillSelect('chat-agent',[['auto','Auto: Main Controller / Best Available'],...allAgents]);
 
   const btwBanner=$('btw-banner');
   if (btwBanner) {
@@ -150,7 +147,7 @@ function render(data) {
     }
   }
 
-  renderAgents(data.agents); renderTasks(data.tasks); renderReports(data.qa_reports);
+  renderAgents(data.agents); renderTasks(data.tasks); renderReports(data.qa_reports); renderBlackboard(data.blackboard || []);
   const grill=data.grill;
   $('grill-progress').textContent=grill.current_phase_detail || 'Start an interview, or define tasks manually.';
   $('grill-question').textContent=grill.current_question?.question || '';
@@ -163,17 +160,49 @@ function render(data) {
   }));
   $('events').replaceChildren(...data.events.slice(0,40).map(event => el('p',`${new Date(event.timestamp).toLocaleTimeString()} [${event.source}] ${event.message}`)));
 }
+function renderBlackboard(entries) {
+  const box = $('blackboard-list');
+  if (!box) return;
+  if (!entries.length) {
+    box.replaceChildren(el('p','Shared blackboard is clear. Agents post @FG:FACT, @FG:CLAIM, and @FG:TRIPWIRE signals here.','muted'));
+    return;
+  }
+  box.replaceChildren(...entries.slice(0,12).map(e => {
+    const badge = e.kind === 'lock' ? '🔒 LOCK' : (e.kind === 'tripwire' ? '⚠️ TRIPWIRE' : '📌 FACT');
+    return el('p', `${badge} [${e.key}] ${e.value || ''} (${e.agent_id || 'system'})`, e.kind === 'tripwire' ? 'warn' : 'muted');
+  }));
+}
 function renderAgents(agents) {
   $('agents').replaceChildren(...agents.map(agent => {
-    const node=card(`${agent.machine_name} · ${agent.status}`,`${agent.display_name} · ${agent.executor} · quota ${agent.used_pct.toFixed(1)}% (reported estimate)`);
+    const ctrlTag = agent.is_controller ? '👑 MAIN CONTROLLER · ' : '';
+    const modelTag = agent.active_model ? ` · model: ${agent.active_model}-${agent.active_effort || 'high'}` : '';
+    const highPct = typeof agent.high_tier_used_pct === 'number' ? agent.high_tier_used_pct.toFixed(1) : '0.0';
+    const node=card(
+      `${ctrlTag}${agent.machine_name} · ${agent.status}`,
+      `${agent.display_name} · ${agent.executor}${modelTag} · standard bucket ${agent.used_pct.toFixed(1)}% · high-reasoning bucket ${highPct}%`
+    );
     const row=el('div',undefined,'row');
-    row.append(button('Rename',async () => { const codename=prompt('Machine code name',agent.machine_name); if (codename) { await api(`/api/agents/${agent.id}/rename`,{codename}); await refresh(); } }),
+    if (!agent.is_controller) {
+      row.append(button('Make Controller', async () => { await api(`/api/agents/${agent.id}/controller`, {}); await refresh(); }));
+    }
+    row.append(
+      button('Steer / Queue Prompt', async () => {
+        const msg = prompt(`Send steering directive or queued prompt to ${agent.machine_name} (prefix with ! to interrupt active run):`);
+        if (!msg) return;
+        const isInterrupt = msg.trim().startsWith('!');
+        const cleanMsg = isInterrupt ? msg.trim().slice(1).trim() : msg.trim();
+        await api(`/api/agents/${agent.id}/steer`, {prompt: cleanMsg, mode: isInterrupt ? 'interrupt' : 'steer'});
+        await refresh();
+      }),
+      button('Rename',async () => { const codename=prompt('Machine code name',agent.machine_name); if (codename) { await api(`/api/agents/${agent.id}/rename`,{codename}); await refresh(); } }),
       button('Report quota / reset',async () => {
         const value=prompt('Current measured quota usage (%)',String(agent.used_pct)); if (value===null) return;
         const pct=Number(value); if (!Number.isFinite(pct) || pct<0 || pct>100) throw new Error('Quota must be between 0 and 100');
         const task=state.tasks.find(t => t.id===agent.current_task_id);
         await api(`/api/agents/${agent.id}/quota`,{used_pct:pct,turns_delta:0,reset_window:pct<agent.used_pct,assignment_id:task?.assignment_id}); await refresh();
-      }),button('Remove worker',async () => { if (confirm('Remove this worker and requeue its active task?')) { await api(`/api/agents/${agent.id}`,undefined,'DELETE'); await refresh(); } }));
+      }),
+      button('Remove worker',async () => { if (confirm('Remove this worker and requeue its active task?')) { await api(`/api/agents/${agent.id}`,undefined,'DELETE'); await refresh(); } })
+    );
     node.append(row); return node;
   }));
   if (!agents.length) $('agents').append(el('p','No workers connected. Create an invitation or register a local executor.','muted'));
@@ -183,7 +212,6 @@ function download(name,data) {
   const link=el('a'); link.href=url; link.download=name; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
 }
 function renderTasks(tasks) {
-  // Spotlight for what is currently being worked on:
   const spotlight = $('active-spotlight');
   if (spotlight) {
     const activeTasks = tasks.filter(t => ['in_progress','in_qa','blocked_environment','blocked_circuit_breaker'].includes(t.status));
@@ -201,7 +229,8 @@ function renderTasks(tasks) {
         
         const agent = state.agents.find(a => a.id === task.assigned_agent_id);
         const ownerName = task.assigned_human ? `Human teammate: ${task.assigned_human}` : (agent ? `${agent.machine_name} (${agent.display_name})` : 'Awaiting worker assignment');
-        node.append(el('p', `Status: ${task.status.toUpperCase()} · Assigned to: ${ownerName} · Phase ${task.phase} · QA retries: ${task.retry_count}/${task.max_retries}`));
+        const roleTag = task.work_role ? ` · Role: ${task.work_role}` : '';
+        node.append(el('p', `Status: ${task.status.toUpperCase()} · Assigned to: ${ownerName} · Phase ${task.phase}${roleTag} · QA retries: ${task.retry_count}/${task.max_retries}`));
         node.append(el('p', task.description));
         node.append(el('p', `Target files: ${task.target_files.join(', ')}`, 'muted'));
         
@@ -240,10 +269,11 @@ function renderTasks(tasks) {
     }
   }
 
-  // Full Task List
   $('tasks').replaceChildren(...tasks.map(task => {
     const agent=state.agents.find(a => a.id===task.assigned_agent_id);
-    const node=card(`${task.id} · ${task.title}`,`Phase ${task.phase} · Tier ${task.complexity_tier} · ${task.status} · QA retries ${task.retry_count}/${task.max_retries}`);
+    const roleLabel = task.work_role ? ` · ${task.work_role}` : '';
+    const holdLabel = task.held_by_controller ? ' · [HELD BY CONTROLLER]' : '';
+    const node=card(`${task.id} · ${task.title}`,`Phase ${task.phase} · Tier ${task.complexity_tier}${roleLabel}${holdLabel} · ${task.status} · QA retries ${task.retry_count}/${task.max_retries}`);
     node.append(el('p',task.description),el('p',`Files: ${task.target_files.join(', ')} · Depends on: ${task.dependencies.join(', ') || 'none'}`,'muted'));
     if (agent || task.assigned_human) node.append(el('p',`Owner: ${task.assigned_human || agent.machine_name}`));
     if (task.blocked_reason) node.append(el('pre',task.blocked_reason,'warn'));
@@ -321,6 +351,16 @@ bind('invite-form',async () => {
   const query=new URLSearchParams({token:invite.token,name:$('invite-name').value,codename:$('invite-code').value,profile:$('invite-profile').value});
   $('win-command').value=`irm "${base}/join.ps1?${query}" | iex`;
   $('bash-command').value=`curl --fail -sSL "${base}/join.sh?${query}" | bash`;
+  if ($('mcp-command')) {
+    $('mcp-command').value=JSON.stringify({
+      mcpServers: {
+        funguys: {
+          command: "funguys",
+          args: ["mcp-worker", "--host-url", base, "--token", invite.token, "--name", $('invite-name').value || "IDE-Agent"]
+        }
+      }
+    }, null, 2);
+  }
   $('invite-expiry').textContent='One machine · expires '+new Date(invite.expires_at).toLocaleString(); $('invite-result').hidden=false;
 },true);
 document.querySelectorAll('[data-copy]').forEach(node => node.addEventListener('click',() => action(async () => {

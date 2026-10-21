@@ -6,7 +6,7 @@ import os
 import unicodedata
 from pathlib import Path, PureWindowsPath
 
-EXCLUDED = {'.git', '.funguys', '.graphify', '.venv', 'venv', 'env', 'node_modules',
+EXCLUDED = {'.git', '.funguys', '.funguys_inbox.md', '.graphify', '.venv', 'venv', 'env', 'node_modules',
             '__pycache__', '.pytest_cache', '.ruff_cache', '.cache', 'dist', 'build', '.aws', '.ssh', '.codex', '.agents'}
 SECRET_NAMES = {'.env', '.netrc', '.npmrc', '.pypirc', 'credentials', 'credentials.json', 'id_rsa', 'id_ed25519'}
 MAX_FILE = 15_000_000
@@ -107,7 +107,7 @@ def bundle(root: Path) -> dict:
     text, binary, total = {}, {}, 0
     for path in source_files(root):
         if path.stat().st_size>MAX_FILE:
-            raise ValueError('Workspace file exceeds the 2 MB worker transfer limit: '+path.relative_to(root).as_posix())
+            raise ValueError(f'Workspace file exceeds the {MAX_FILE // 1_000_000} MB worker transfer limit: ' + path.relative_to(root).as_posix())
         with path.open('rb') as stream:
             content = stream.read(MAX_FILE+1)
         total += len(content)
