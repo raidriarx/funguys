@@ -3,33 +3,33 @@
 > **DIRECTIVE FOR CODING AGENT**:
 > Follow Steps 1 through 7 in exact sequential order.
 > **Critical Invariants to Preserve**:
-> 1. `funguys/worker/runtime.py` is served standalone via `GET /worker.py` to remote machines that do **not** have the `funguys` package installed. Therefore, `funguys/worker/runtime.py` MUST ONLY import Python standard-library modules at the top level. Define model-tier resolution, token-weight scoring, protocol parsing, and compression helpers inside `runtime.py` and re-export them in `funguys/protocol.py`.
+> 1. `funguys/worker/runtime.py` is served standalone via `GET /worker.py` to remote machines that do **not** have the `funguys` package installed. Therefore, `funguys/worker/runtime.py` MUST ONLY import Python standard-library modules at the top level. Define model-tier resolution, protocol parsing, and compression helpers inside `runtime.py` and re-export them in `funguys/protocol.py`.
 > 2. Preserve existing test-facing symbols (`generate_task_code_artifact` in `adapters.py`, `simulate_demo` in `demo.py`, `public_destination` and `fetch_public_page` in `mcp_bridge/server.py`, and legacy profile keys `'claude-max'`, `'claude-pro'`, `'codex-pro'`, `'gemini-cli'`) so all 55 existing tests in `tests/` continue to pass without regression.
-> 3. Enforce the **Cross-Provider Planning Priority (`claude opus:high` $\to$ `gemini argon:medium` $\to$ `codex astra:low`)** and **Token-Heavy Task Offloading to High-Usage-Rate Models** defined in Steps 1, 2, and 5 below.
+> 3. Enforce the **Cross-Provider Planning Priority (`claude opus:high` $\to$ `gemini argon:medium` $\to$ `codex astra:low`)** and **Main Controller Classification of `"important_coding"` (`argon:low` / `opus:high` / `sol:high`) vs. `"gruntwork"` & `"testing"` (`flash:high` / `opus:medium` / `sol:high`)** defined in Steps 1, 2, 3, and 5 below.
 
 ---
 
-## STEP 1: USAGE-RATE PRIORITY MATRIX, CONFIG & MODELS (`config.py`, `models.py`, `db.py`)
+## STEP 1: CONTROLLER WORK CLASSIFICATION, PRIORITY MATRIX, CONFIG & MODELS (`config.py`, `models.py`, `db.py`)
 
-### 1.1 Exact Cross-Provider Priority & Model-Effort Policy
+### 1.1 Exact Cross-Provider Priority & Controller Work Classification Policy
 
 1. **Planning / Controller Priority Order (Highest Usage Rate to Lowest)**:
    - **Priority 1 (`rank=0`)**: `provider == "claude"` $\to$ **`("opus", "high")`**
    - **Priority 2 (`rank=1`)**: `provider == "gemini"` $\to$ **`("argon", "medium")`**
    - **Priority 3 (`rank=2`)**: `provider == "codex"` $\to$ **`("astra", "low")`**
-2. **Task Role & Token-Weight Classification**:
-   - `"planning"` — Architect interview, DAG compilation, and Main Controller arbitration (**NO file editing**).
-   - `"hard_coding"` — `complexity_tier == 1` and not a testing task.
-   - `"token_heavy_coding"` — Any coding task where `is_token_heavy_task(task)` is `True` (e.g., `len(target_files) >= 3`, `len(description) > 1200`, `retry_count >= 1`, or existing target files exceed `12_000` bytes).
-   - `"easy_coding"` — `complexity_tier == 2` and not a testing task.
-   - `"testing"` — `require_tests == True` or target files are test files (`test_*` / `*_test.*` / `tests/*`).
+2. **Main Controller Work Classification (No Blind Token-Size Downgrading)**:
+   - Do **not** downgrade a task based on file size or token count—a large task can still be critical architectural work! Instead, the **Main Controller / Planner Agent** classifies every task into one of 4 roles (and can dynamically re-classify any task via `@FG:STEER` or `complexity_tier`):
+     - `"planning"` — Architect interview, DAG compilation, and Main Controller arbitration (**NO file editing**).
+     - `"important_coding"` — (`complexity_tier == 1`): Core domain logic, complex algorithms, critical architecture, tricky bug fixes (even if large/token-heavy).
+     - `"gruntwork"` — (`complexity_tier == 2` non-test): Boilerplate, UI scaffolding, CRUD wiring, config/docs, mechanical refactors.
+     - `"testing"` — (`require_tests == True` or `tests/*` target files): Unit, integration, and E2E test authoring and verification.
 3. **Provider-to-Model Mapping**:
 
-| Provider | `"planning"` | `"hard_coding"` (Compact) | `"token_heavy_coding"` (High Token Load) | `"easy_coding"` | `"testing"` | Hard Floor |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`claude`** *(Priority 1)* | `("opus", "high")` | `("opus", "high")` | `("opus", "high")` *(or `("opus", "medium")` if `high_tier_used_pct >= 75%`)* | `("opus", "medium")` | `("opus", "medium")` | `("opus", "medium")` |
-| **`gemini`** *(Priority 2)* | `("argon", "medium")` | `("argon", "low")` *(fallback: `("flash", "high")`)* | **`("flash", "high")`** *(Never waste Argon on token-heavy tasks)* | `("argon", "low")` *(or `("flash", "high")` if `high_tier_used_pct >= 60%`)* | **`("flash", "high")`** | `("flash", "high")` |
-| **`codex`** *(Priority 3)* | `("astra", "low")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` |
+| Provider | `"planning"` (No Coding) | `"important_coding"` (Tier 1: Critical Work, Even If Large) | `"gruntwork"` (Tier 2: Boilerplate / Easy Work) | `"testing"` (Tests / QA) | Hard Floor (Never Lower) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`claude`** *(Priority 1)* | `("opus", "high")` | `("opus", "high")` | `("opus", "medium")` | `("opus", "medium")` | `("opus", "medium")` |
+| **`gemini`** *(Priority 2)* | `("argon", "medium")` | **`("argon", "low")`** *(Fallback to `("flash", "high")` ONLY if Argon quota exhausted)* | **`("flash", "high")`** *(100% of gruntwork runs on Flash High to save Argon)* | **`("flash", "high")`** | `("flash", "high")` |
+| **`codex`** *(Priority 3)* | `("astra", "low")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` |
 
 ### 1.2 Edit `funguys/config.py`
 Add `PLANNER_PROVIDER_PRIORITY = {"claude": 0, "gemini": 1, "codex": 2, "mcp": 1, "api": 3}` and `MODEL_ROUTING_POLICY`:
@@ -39,12 +39,12 @@ class SubscriptionProfile:
     provider: str
     cli_command: str
     display_name: str
-    tier: int  # 1 = High-Reasoning/Architect/Hard-Coding, 2 = Builder/Easy-Coding/Testing
+    tier: int  # 1 = Important Work / Architect, 2 = Gruntwork / Testing
     window_hours: float
     estimated_turns_per_window: int
     soft_handoff_threshold_pct: float = 80.0
     high_tier_turns_per_window: int = 25  # Separate rate limit bucket for Opus-High / Argon / Astra-Low
-    usage_rate_rank: int = 1  # Lower = Higher usage rate capacity
+    usage_rate_rank: int = 1
     strengths: List[str] = ()
 
 PLANNER_PROVIDER_PRIORITY: Dict[str, int] = {
@@ -58,25 +58,22 @@ PLANNER_PROVIDER_PRIORITY: Dict[str, int] = {
 MODEL_ROUTING_POLICY: Dict[str, Dict[str, tuple[str, str]]] = {
     "claude": {
         "planning": ("opus", "high"),
-        "hard_coding": ("opus", "high"),
-        "token_heavy_coding": ("opus", "high"),
-        "easy_coding": ("opus", "medium"),
+        "important_coding": ("opus", "high"),
+        "gruntwork": ("opus", "medium"),
         "testing": ("opus", "medium"),
         "fallback": ("opus", "medium"),
     },
     "gemini": {
         "planning": ("argon", "medium"),
-        "hard_coding": ("argon", "low"),
-        "token_heavy_coding": ("flash", "high"),
-        "easy_coding": ("argon", "low"),
+        "important_coding": ("argon", "low"),
+        "gruntwork": ("flash", "high"),
         "testing": ("flash", "high"),
         "fallback": ("flash", "high"),
     },
     "codex": {
         "planning": ("astra", "low"),
-        "hard_coding": ("sol", "high"),
-        "token_heavy_coding": ("sol", "high"),
-        "easy_coding": ("sol", "high"),
+        "important_coding": ("sol", "high"),
+        "gruntwork": ("sol", "high"),
         "testing": ("sol", "high"),
         "fallback": ("sol", "high"),
     },
@@ -89,8 +86,7 @@ Keep legacy keys `"claude-max"`, `"claude-pro"`, `"codex-pro"`, `"gemini-cli"` (
 2. Add fields to `TaskItem`:
    - `held: bool = False`
    - `hold_reason: Optional[str] = None`
-   - `task_role: Optional[str] = None`
-   - `token_heavy: bool = False`
+   - `task_role: Optional[Literal["planning", "important_coding", "gruntwork", "testing"]] = None`
    - `assigned_model: Optional[str] = None`
 3. Add fields to `AgentNode`:
    - Change `executor: Literal['remote', 'local', 'mcp_ide'] = 'remote'`
@@ -113,57 +109,44 @@ Add `prompt_queue` and `blackboard` tables to `StateStore._init_schema()` and im
 
 ---
 
-## STEP 2: STANDALONE PROTOCOL, TOKEN-HEAVY DETECTOR & MODEL-TIER SELECTOR (`runtime.py` & `protocol.py`)
+## STEP 2: STANDALONE PROTOCOL & CONTROLLER ROLE SELECTOR (`runtime.py` & `protocol.py`)
 
 ### 2.1 Edit `funguys/worker/runtime.py`
 Remember: `runtime.py` MUST only import Python standard library modules at the top level.
 
-1. **Add Token-Heavy Task Detector & Model-Effort Selector**:
+1. **Add Controller Role Classifier (`classify_task_role`) & Model-Effort Selector (`select_model_and_effort`)**:
    ```python
    PLANNER_PRIORITY = {'claude': 0, 'gemini': 1, 'codex': 2, 'mcp': 1, 'api': 3}
 
    MODEL_POLICY = {
        'claude': {
            'planning': ('opus', 'high'),
-           'hard_coding': ('opus', 'high'),
-           'token_heavy_coding': ('opus', 'high'),
-           'easy_coding': ('opus', 'medium'),
+           'important_coding': ('opus', 'high'),
+           'gruntwork': ('opus', 'medium'),
            'testing': ('opus', 'medium'),
            'fallback': ('opus', 'medium'),
        },
        'gemini': {
            'planning': ('argon', 'medium'),
-           'hard_coding': ('argon', 'low'),
-           'token_heavy_coding': ('flash', 'high'),
-           'easy_coding': ('argon', 'low'),
+           'important_coding': ('argon', 'low'),
+           'gruntwork': ('flash', 'high'),
            'testing': ('flash', 'high'),
            'fallback': ('flash', 'high'),
        },
        'codex': {
            'planning': ('astra', 'low'),
-           'hard_coding': ('sol', 'high'),
-           'token_heavy_coding': ('sol', 'high'),
-           'easy_coding': ('sol', 'high'),
+           'important_coding': ('sol', 'high'),
+           'gruntwork': ('sol', 'high'),
            'testing': ('sol', 'high'),
            'fallback': ('sol', 'high'),
        },
    }
 
-   def is_token_heavy_task(task: dict, workspace_root: Path | None = None) -> bool:
-       if task.get('token_heavy'):
-           return True
-       files = task.get('target_files') or []
-       if len(files) >= 3 or int(task.get('retry_count', 0)) >= 1 or len(str(task.get('description', ''))) > 1200:
-           return True
-       if workspace_root and workspace_root.exists():
-           total_size = sum((workspace_root / f).stat().st_size for f in files if (workspace_root / f).is_file())
-           if total_size > 12_000:
-               return True
-       return False
-
-   def classify_task_role(task: dict, workspace_root: Path | None = None) -> str:
-       if task.get('task_role') in ('planning', 'hard_coding', 'token_heavy_coding', 'easy_coding', 'testing'):
-           return task['task_role']
+   def classify_task_role(task: dict) -> str:
+       """Use the Main Controller's explicit role or complexity_tier (1=important_coding, 2=gruntwork/testing)."""
+       explicit = task.get('task_role')
+       if explicit in ('planning', 'important_coding', 'gruntwork', 'testing'):
+           return explicit
        files = [str(f).lower() for f in (task.get('target_files') or [])]
        title_lower = str(task.get('title', '')).lower()
        if (
@@ -172,9 +155,9 @@ Remember: `runtime.py` MUST only import Python standard library modules at the t
            or ('test' in title_lower and any('test' in f for f in files))
        ):
            return 'testing'
-       if is_token_heavy_task(task, workspace_root):
-           return 'token_heavy_coding'
-       return 'hard_coding' if int(task.get('complexity_tier', 2)) == 1 else 'easy_coding'
+       # Controller sets complexity_tier=1 for important work (even if large) -> argon:low / opus:high / sol:high
+       # Controller sets complexity_tier=2 for gruntwork -> flash:high / opus:medium / sol:high
+       return 'important_coding' if int(task.get('complexity_tier', 2)) == 1 else 'gruntwork'
 
    def select_model_and_effort(provider: str, role: str, high_tier_used_pct: float = 0.0, force_fallback: bool = False) -> tuple[str, str]:
        policy = MODEL_POLICY.get(provider, MODEL_POLICY['claude'])
@@ -183,20 +166,15 @@ Remember: `runtime.py` MUST only import Python standard library modules at the t
        if provider == 'gemini':
            if role == 'planning':
                return ('argon', 'medium')
-           # Token-heavy tasks, testing, or high Argon usage always route to high-usage-rate flash:high
-           if role in ('testing', 'token_heavy_coding') or high_tier_used_pct >= 85.0:
-               return ('flash', 'high')
-           if role == 'easy_coding' and high_tier_used_pct >= 60.0:
-               return ('flash', 'high')
-           return ('argon', 'low')
+           if role == 'important_coding':
+               # Important work uses argon:low even if large, only falling back to flash:high if Argon bucket is exhausted (>=85%)
+               return ('flash', 'high') if high_tier_used_pct >= 85.0 else ('argon', 'low')
+           # All gruntwork and testing run on flash:high so Argon is conserved for important work and planning
+           return ('flash', 'high')
        if provider == 'codex':
            return ('astra', 'low') if role == 'planning' else ('sol', 'high')
        if provider == 'claude':
-           if role in ('planning', 'hard_coding'):
-               return ('opus', 'high')
-           if role == 'token_heavy_coding':
-               return ('opus', 'medium') if high_tier_used_pct >= 75.0 else ('opus', 'high')
-           return ('opus', 'medium')
+           return ('opus', 'high') if role in ('planning', 'important_coding') else ('opus', 'medium')
        return policy.get(role, policy['fallback'])
    ```
 
@@ -223,11 +201,11 @@ Remember: `runtime.py` MUST only import Python standard library modules at the t
    - Checkpoint WIP files on cancel, and send parsed `signals` on task submission.
 
 ### 2.2 Create `funguys/protocol.py`
-Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_task_role`, `select_model_and_effort`, `SIGNAL_PATTERN`, `parse_raw_signals`, `compress_error_log`, `slice_contract_for_task`, and `parse_agent_signals`.
+Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `classify_task_role`, `select_model_and_effort`, `SIGNAL_PATTERN`, `parse_raw_signals`, `compress_error_log`, `slice_contract_for_task`, and `parse_agent_signals`.
 
 ---
 
-## STEP 3: PLANNER PRIORITY (`OPUS HIGH` $\to$ `ARGON MEDIUM` $\to$ `ASTRA LOW`) & WORK PARSING (`architect.py`, `adapters.py`, `app.py`)
+## STEP 3: PLANNER PRIORITY (`OPUS HIGH` $\to$ `ARGON MEDIUM` $\to$ `ASTRA LOW`) & IMPORTANT vs. GRUNTWORK PARSING (`architect.py`, `adapters.py`, `app.py`)
 
 1. **Edit `funguys/worker/adapters.py` (`detect_available_clis`)**:
    - Order CLI detection by planning usage-rate priority:
@@ -253,7 +231,11 @@ Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_t
 3. **Edit `funguys/host/architect.py`**:
    - Default `self.provider = "claude"` (falling back to `"gemini"` then `"codex"` based on `select_architect`).
    - Pass `role='planning'` to `run_text_agent(self.provider, ..., role='planning')` so planning always uses `opus:high`, `argon:medium`, or `astra:low`.
-   - In `compile_plan_and_tasks()`, instruct the planner to parse work into atomic 1–2 file tasks and separate `hard_coding`, `easy_coding`, and `testing` tasks so token-heavy and testing work is offloaded to high-usage-rate models (`sol:high`, `flash:high`, `opus:medium`).
+   - In `compile_plan_and_tasks()`, instruct the planner (Main Controller) to classify each task explicitly into:
+     - **`complexity_tier: 1`, `task_role: "important_coding"`**: Core algorithms, architecture, and critical logic (even if the task is large)—routed to `argon:low`, `opus:high`, or `sol:high`.
+     - **`complexity_tier: 2`, `task_role: "gruntwork"`**: Boilerplate, CRUD, UI scaffolding, config, and simple wiring—offloaded to `flash:high`, `opus:medium`, or `sol:high`.
+     - **`complexity_tier: 2`, `task_role: "testing"`, `require_tests: true`**: Test suites and QA verification—offloaded to `flash:high`, `opus:medium`, or `sol:high`.
+     - If an important feature is large, split the critical logic into an `"important_coding"` task and split the surrounding boilerplate/tests into `"gruntwork"` and `"testing"` tasks.
 
 ---
 
@@ -267,16 +249,15 @@ Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_t
 
 ---
 
-## STEP 5: MAIN CONTROLLER & USAGE-RATE-AWARE SCHEDULER (`funguys/host/orchestrator.py`)
+## STEP 5: MAIN CONTROLLER & WORK-IMPORTANCE SCHEDULER (`funguys/host/orchestrator.py`)
 
 1. **Default Controller Selection Priority (`claude` $\to$ `gemini` $\to$ `codex`)**:
    - When selecting or auto-assigning the Main Controller Agent (`designate_controller` / `_get_controller_agent`), rank candidates by `(PLANNER_PROVIDER_PRIORITY.get(a.provider, 99), a.high_tier_used_pct, a.used_pct)`.
-2. **Route Token-Heavy Tasks & Hard Coding by Usage Rate in `select_best_agent_for_task`**:
+2. **Route by Controller-Assigned Work Importance (`important_coding` vs. `gruntwork` / `testing`) in `select_best_agent_for_task`**:
    ```python
    def select_best_agent_for_task(self, task, available=None):
        from funguys.config import PLANNER_PROVIDER_PRIORITY
-       role = classify_task_role(task.model_dump(), self.git.workspace_path if hasattr(self, 'git') else None)
-       heavy = is_token_heavy_task(task.model_dump(), self.git.workspace_path if hasattr(self, 'git') else None)
+       role = classify_task_role(task.model_dump())
        pool = [
            a for a in (available if available is not None else self.store.list_agents())
            if a.status == AgentStatus.IDLE
@@ -286,31 +267,34 @@ Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_t
        ]
        if not pool:
            return None
-       if role == 'testing' or heavy:
-           # Offload testing and token-heavy tasks to high-usage-rate models (sol:high, flash:high, opus:medium/high)
+       if role in ('gruntwork', 'testing'):
+           # Gruntwork and testing use flash:high (Gemini), opus:medium (Claude), or sol:high (ChatGPT)
            return min(
                pool,
                key=lambda a: (
-                   a.tier != task.complexity_tier if not (role == 'testing' or heavy) else False,
+                   a.tier != task.complexity_tier if role != 'testing' else False,
                    a.used_pct,
-                   PLANNER_PROVIDER_PRIORITY.get(a.provider, 99),
                    a.id,
                ),
            )
+       # role == 'important_coding' (Tier 1 critical work, even if large):
+       # Runs on argon:low (Gemini), opus:high (Claude), or sol:high (ChatGPT)
        tier_matched = [a for a in pool if task.complexity_tier != 1 or a.tier == 1]
        candidates = tier_matched if tier_matched else pool
        return min(
            candidates,
            key=lambda a: (
                a.tier != task.complexity_tier,
-               PLANNER_PROVIDER_PRIORITY.get(a.provider, 99),
                a.high_tier_used_pct if a.provider == 'gemini' else a.used_pct,
                a.used_pct,
+               PLANNER_PROVIDER_PRIORITY.get(a.provider, 99),
                a.id,
            ),
        )
    ```
-   *(Note: Verify against `test_plan_approval_gate_and_role_based_tier_routing`: `Alex` is `claude-max` (`tier=1`, `PLANNER_PROVIDER_PRIORITY['claude'] == 0`), `Sam` is `gemini-cli` (`tier=2`, `PLANNER_PROVIDER_PRIORITY['gemini'] == 1`). For `task-1-contracts` (`complexity_tier=1`, 1 target file `backend/service.py`), `Alex` is selected first, passing the test!)*
+   *(Note: Verify against `test_plan_approval_gate_and_role_based_tier_routing`: `Alex` is `claude-max` (`tier=1`), `Sam` is `gemini-cli` (`tier=2`). For `task-1-contracts` (`complexity_tier=1`), `a.tier != task.complexity_tier` is `False` for `Alex` and `True` for `Sam`, so `Alex` is selected, passing the test!)*
+3. **Dynamic Re-Classification via Controller `@FG:STEER`**:
+   - Allow `@FG:STEER` signals from the Main Controller to include `ROLE=important_coding` or `ROLE=gruntwork` to promote or demote a task's importance (`task.task_role` and `task.complexity_tier`) at any time.
 3. **Separate Bucket Accounting in `_finish_agent`**:
    - High-tier models (`argon:medium`, `argon:low`, `astra:low`, `opus:high`) increment `agent.high_tier_turns_used` and `agent.high_tier_used_pct`.
    - High-usage-rate workhorse models (`flash:high`, `sol:high`, `opus:medium`) increment `agent.turns_used` and `agent.used_pct` without touching `high_tier_used_pct`.

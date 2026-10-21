@@ -5,9 +5,11 @@
 The goal of this upgrade is to transform **FunGuys** from a static batch-task runner into a **token-efficient, multi-agent command-and-control (C2) coordination network** where:
 1. **AI agents can communicate, trigger each other, and queue/steer prompts** to any other agent mid-flight.
 2. **All coordination routes through One Main Controller Agent** (hub-and-spoke architecture) so agents never get stuck in chaotic N×N chat loops.
-3. **Usage-Rate Priority Routing (High-Allowance Models First)**:
+3. **Controller-Driven Work Classification (Important Work vs. Gruntwork/Testing)**:
    - **Planning Priority Order**: Always defaults to **1st: Claude (`opus:high`) $\to$ 2nd: Google (`argon:medium`) $\to$ 3rd: ChatGPT (`astra:low`)**, matching the exact order of how much usage rate each model has.
-   - **Token-Heavy Tasks Default to High-Usage-Rate Models**: Token-heavy coding, multi-file edits, retries, and all testing are automatically routed to high-usage-rate models (**`sol:high`**, **`flash:high`**, **`opus:high` / `opus:medium`**) so scarce rate-limited models (**`astra:low`**, **`argon:medium`**, **`argon:low`**) never get drained by heavy token loads.
+   - **Main Controller Decides "Important Work" vs. "Gruntwork"**: Rather than blindly downgrading a task just because it is large or token-heavy, the **Main Controller Agent** explicitly classifies each task (and can dynamically re-classify via `@FG:STEER`) into:
+     - **Important Work (`important_coding`, Tier 1)**: Core algorithms, critical architecture, security, and complex logic—even if large—are routed to **`argon:low`** (Google), **`opus:high`** (Claude), or **`sol:high`** (ChatGPT).
+     - **Gruntwork & Testing (`gruntwork` / `testing`, Tier 2)**: Boilerplate, repetitive wiring, UI scaffolding, and all test suites are offloaded to **`flash:high`** (Google), **`opus:medium`** (Claude), and **`sol:high`** (ChatGPT) so Argon is never wasted on gruntwork.
 4. **Coordination uses the July 2026 ExploitGym / Hugging Face Swarm primitives**—stripped of cryptographic signatures (`Ed25519`) and folder-name encoding—leaving pure, telegraphic synchronization signals (`CLAIM`, `RELEASE`, `FACT`, `TRIPWIRE`, `TRIGGER`, `STEER`, `HOLD`, `GO`, `VETO`) and a **Shared Blackboard**.
 5. **Cross-Platform & Serverless Laptop Operation**: Works natively on **macOS, Windows, and Linux**, supports **Claude (`claude`), ChatGPT (`codex`), Google (`gemini`/`agy`), and IDE/Desktop AI apps** (Cursor, Windsurf, Antigravity, Claude Desktop, ChatGPT App), and runs **100% free on laptops using GitHub (`fg-c2` branch)** and free tunnels with zero paid servers.
 
@@ -21,30 +23,27 @@ When selecting the Lead Architect or Main Controller Agent across all connected 
 2. **2nd Choice — Google `argon` (`medium`)**: Second-highest planning allowance; strictly reserved for planning/steering (no coding).
 3. **3rd Choice — ChatGPT `astra` (`low`)**: Tightest usage rate limit; used for planning only when neither Claude nor Google is available, at `low` effort to conserve Astra quota.
 
-### 2.2 Per-Provider Model & Effort Table
-| Task Role | 1st Priority: Claude (`claude`) | 2nd Priority: Google (`gemini` / `agy`) | 3rd Priority: ChatGPT (`codex`) |
+### 2.2 Per-Provider Model & Effort Table (Important Work vs. Gruntwork)
+| Work Classification (Set by Main Controller) | 1st Priority: Claude (`claude`) | 2nd Priority: Google (`gemini` / `agy`) | 3rd Priority: ChatGPT (`codex`) |
 | :--- | :--- | :--- | :--- |
 | **1. Planning & Controller** *(Zero Coding)* | **`opus` (`high`)** *(1st Default)* | **`argon` (`medium`)** *(2nd Default)* | **`astra` (`low`)** *(3rd Default)* |
-| **2. Hard Coding** *(Tier 1: Core/Backend)* | **`opus` (`high`)** | **`argon` (`low`)** *(compact tasks; heavy tasks & fallback use **`flash` (`high`)**)* | **`sol` (`high`)** *(Handles all coding so Astra is untouched)* |
-| **3. Token-Heavy Coding** *(Multi-file, large context, or retries)* | **`opus` (`high` / `medium`)** | **`flash` (`high`)** *(Protects Argon from high token burn)* | **`sol` (`high`)** |
-| **4. Easy Coding** *(Tier 2: UI/Wiring/Boilerplate)* | **`opus` (`medium`)** | **`argon` (`low`)** $\to$ **`flash` (`high`)** | **`sol` (`high`)** |
-| **5. Testing & QA** *(All test authoring & fixes)* | **`opus` (`medium`)** | **`flash` (`high`)** | **`sol` (`high`)** |
+| **2. Important Work (`important_coding`, Tier 1)** *(Core logic, complex or large critical tasks)* | **`opus` (`high`)** | **`argon` (`low`)** *(Fallbacks to **`flash` (`high`)** only if Argon quota is exhausted)* | **`sol` (`high`)** *(Handles all coding so Astra is untouched)* |
+| **3. Gruntwork (`gruntwork`, Tier 2)** *(Boilerplate, CRUD, simple UI, config, docs)* | **`opus` (`medium`)** | **`flash` (`high`)** *(100% offloaded from Argon)* | **`sol` (`high`)** |
+| **4. Testing & QA (`testing`, Tier 2)** *(All test authoring & verification fixes)* | **`opus` (`medium`)** | **`flash` (`high`)** *(100% offloaded from Argon)* | **`sol` (`high`)** |
 | **Hard Floor** *(Never go lower than)* | **`opus` (`medium`)** | **`flash` (`high`)** | **`sol` (`high`)** |
 
-### 2.3 How Token-Heavy Tasks & Separate Usage Buckets Are Managed
-1. **Automatic Token-Weight Scoring (`is_token_heavy_task`)**:
-   - Before dispatching a task, the Host calculates its token weight based on:
-     - Number of `target_files` ($\ge 3$ files = heavy)
-     - Total byte size of existing `target_files` ($> 12\text{ KB}$ = heavy)
-     - Retry status (`retry_count >= 1` with QA logs = heavy)
-     - Testing requirement (`require_tests == True` = heavy tool-loop count)
-   - **Rule**: Any task flagged as `token_heavy` is routed to high-usage-rate models (**`sol:high`**, **`flash:high`**, or **`opus:high`/`opus:medium`**) and **never** assigned to `argon:low` unless forced by fallback to `flash:high`.
-2. **Cross-Provider Task Assignment Priority**:
-   - For **Hard Coding (`complexity_tier == 1`)**: Prefer **Claude (`opus:high`)** or **ChatGPT (`sol:high`)** before **Google (`argon:low`)** so Argon's tight rate limit is spared whenever Claude or ChatGPT workers are available.
-   - For **Token-Heavy & Testing Tasks**: Prefer high-throughput pools (**`flash:high`**, **`sol:high`**, **`opus:medium`**).
-3. **Dual-Bucket Usage Tracking & In-Place Fallback (`argon-low` $\to$ `flash-high`)**:
+### 2.3 How the Main Controller Separates Important Work from Gruntwork
+1. **Semantic Classification Over Blind Size Heuristics**:
+   - A large task can still be **mission-critical**. Instead of a naive token-size check that would mistakenly downgrade an important large task to a weaker model, the **Main Controller Agent** (`opus:high` $\to$ `argon:medium` $\to$ `astra:low`) explicitly tags every task with `task_role`:
+     - `"important_coding"` (`complexity_tier = 1`): Routed to **`argon:low`** (Google), **`opus:high`** (Claude), or **`sol:high`** (ChatGPT).
+     - `"gruntwork"` (`complexity_tier = 2`): Routed directly to **`flash:high`** (Google), **`opus:medium`** (Claude), or **`sol:high`** (ChatGPT).
+     - `"testing"` (`complexity_tier = 2`, `require_tests = True`): Routed directly to **`flash:high`**, **`opus:medium`**, or **`sol:high`**.
+2. **Splitting Large Important Tasks into Core + Gruntwork**:
+   - When the Main Controller sees a large important feature, it splits the **critical core engine** into an `"important_coding"` task (for `argon:low` / `opus:high` / `sol:high`) and splits the **surrounding boilerplate, scaffolding, and tests** into `"gruntwork"` and `"testing"` tasks (for `flash:high` / `opus:medium` / `sol:high`).
+3. **Dual-Bucket Usage Tracking & Exhaustion Fallback (`argon-low` $\to$ `flash-high`)**:
    - Tracks `high_tier_used_pct` (Argon / Astra / Opus-High bucket) separately from `used_pct` (Flash-High / Sol-High / Opus-Medium bucket).
-   - If `argon-low` hits a rate limit (`429`) mid-task or `high_tier_used_pct >= 60%` on a medium/heavy task, the worker immediately switches to `flash-high` in-place without failing the task.
+   - Because all `"gruntwork"` and `"testing"` on Google run directly on **`flash:high`**, **100% of the Argon coding budget is saved exclusively for `"important_coding"` (`argon:low`)** and `"planning"` (`argon:medium`).
+   - Only if the Argon bucket actually runs out (`>= 85%` or hits a `429` rate limit mid-task) does `"important_coding"` fall back to `flash:high` so work never stalls.
 
 ---
 
