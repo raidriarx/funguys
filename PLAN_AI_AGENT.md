@@ -5,7 +5,7 @@
 > **Critical Invariants to Preserve**:
 > 1. `funguys/worker/runtime.py` is served standalone via `GET /worker.py` to remote machines that do **not** have the `funguys` package installed. Therefore, `funguys/worker/runtime.py` MUST ONLY import Python standard-library modules at the top level. Define model-tier resolution, token-weight scoring, protocol parsing, and compression helpers inside `runtime.py` and re-export them in `funguys/protocol.py`.
 > 2. Preserve existing test-facing symbols (`generate_task_code_artifact` in `adapters.py`, `simulate_demo` in `demo.py`, `public_destination` and `fetch_public_page` in `mcp_bridge/server.py`, and legacy profile keys `'claude-max'`, `'claude-pro'`, `'codex-pro'`, `'gemini-cli'`) so all 55 existing tests in `tests/` continue to pass without regression.
-> 3. Enforce the **Cross-Provider Planning Priority (`claude opus:high` $\to$ `codex astra:medium` $\to$ `gemini argon:medium`)** and **Token-Heavy Task Offloading to High-Usage-Rate Models** defined in Steps 1, 2, and 5 below.
+> 3. Enforce the **Cross-Provider Planning Priority (`claude opus:high` $\to$ `gemini argon:medium` $\to$ `codex astra:low`)** and **Token-Heavy Task Offloading to High-Usage-Rate Models** defined in Steps 1, 2, and 5 below.
 
 ---
 
@@ -15,8 +15,8 @@
 
 1. **Planning / Controller Priority Order (Highest Usage Rate to Lowest)**:
    - **Priority 1 (`rank=0`)**: `provider == "claude"` $\to$ **`("opus", "high")`**
-   - **Priority 2 (`rank=1`)**: `provider == "codex"` $\to$ **`("astra", "medium")`**
-   - **Priority 3 (`rank=2`)**: `provider == "gemini"` $\to$ **`("argon", "medium")`**
+   - **Priority 2 (`rank=1`)**: `provider == "gemini"` $\to$ **`("argon", "medium")`**
+   - **Priority 3 (`rank=2`)**: `provider == "codex"` $\to$ **`("astra", "low")`**
 2. **Task Role & Token-Weight Classification**:
    - `"planning"` — Architect interview, DAG compilation, and Main Controller arbitration (**NO file editing**).
    - `"hard_coding"` — `complexity_tier == 1` and not a testing task.
@@ -28,11 +28,11 @@
 | Provider | `"planning"` | `"hard_coding"` (Compact) | `"token_heavy_coding"` (High Token Load) | `"easy_coding"` | `"testing"` | Hard Floor |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`claude`** *(Priority 1)* | `("opus", "high")` | `("opus", "high")` | `("opus", "high")` *(or `("opus", "medium")` if `high_tier_used_pct >= 75%`)* | `("opus", "medium")` | `("opus", "medium")` | `("opus", "medium")` |
-| **`codex`** *(Priority 2)* | `("astra", "medium")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` |
-| **`gemini`** *(Priority 3)* | `("argon", "medium")` | `("argon", "low")` *(fallback: `("flash", "high")`)* | **`("flash", "high")`** *(Never waste Argon on token-heavy tasks)* | `("argon", "low")` *(or `("flash", "high")` if `high_tier_used_pct >= 60%`)* | **`("flash", "high")`** | `("flash", "high")` |
+| **`gemini`** *(Priority 2)* | `("argon", "medium")` | `("argon", "low")` *(fallback: `("flash", "high")`)* | **`("flash", "high")`** *(Never waste Argon on token-heavy tasks)* | `("argon", "low")` *(or `("flash", "high")` if `high_tier_used_pct >= 60%`)* | **`("flash", "high")`** | `("flash", "high")` |
+| **`codex`** *(Priority 3)* | `("astra", "low")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` | `("sol", "high")` |
 
 ### 1.2 Edit `funguys/config.py`
-Add `PLANNER_PROVIDER_PRIORITY = {"claude": 0, "codex": 1, "gemini": 2, "mcp": 1, "api": 3}` and `MODEL_ROUTING_POLICY`:
+Add `PLANNER_PROVIDER_PRIORITY = {"claude": 0, "gemini": 1, "codex": 2, "mcp": 1, "api": 3}` and `MODEL_ROUTING_POLICY`:
 ```python
 @dataclass(frozen=True)
 class SubscriptionProfile:
@@ -43,14 +43,14 @@ class SubscriptionProfile:
     window_hours: float
     estimated_turns_per_window: int
     soft_handoff_threshold_pct: float = 80.0
-    high_tier_turns_per_window: int = 25  # Separate rate limit bucket for Opus-High / Astra / Argon
-    usage_rate_rank: int = 1  # Lower = Higher usage rate capacity (0=Claude/Sol/Flash high-rate, 2=Argon tight rate)
+    high_tier_turns_per_window: int = 25  # Separate rate limit bucket for Opus-High / Argon / Astra-Low
+    usage_rate_rank: int = 1  # Lower = Higher usage rate capacity
     strengths: List[str] = ()
 
 PLANNER_PROVIDER_PRIORITY: Dict[str, int] = {
     "claude": 0,  # 1st choice for planning: Claude Opus High (highest usage rate)
-    "codex": 1,   # 2nd choice for planning: ChatGPT Astra Medium
-    "gemini": 2,  # 3rd choice for planning: Gemini Argon Medium (lowest usage rate)
+    "gemini": 1,  # 2nd choice for planning: Gemini Argon Medium
+    "codex": 2,   # 3rd choice for planning: ChatGPT Astra Low (lowest planning usage rate)
     "mcp": 1,
     "api": 3,
 }
@@ -64,14 +64,6 @@ MODEL_ROUTING_POLICY: Dict[str, Dict[str, tuple[str, str]]] = {
         "testing": ("opus", "medium"),
         "fallback": ("opus", "medium"),
     },
-    "codex": {
-        "planning": ("astra", "medium"),
-        "hard_coding": ("sol", "high"),
-        "token_heavy_coding": ("sol", "high"),
-        "easy_coding": ("sol", "high"),
-        "testing": ("sol", "high"),
-        "fallback": ("sol", "high"),
-    },
     "gemini": {
         "planning": ("argon", "medium"),
         "hard_coding": ("argon", "low"),
@@ -80,9 +72,17 @@ MODEL_ROUTING_POLICY: Dict[str, Dict[str, tuple[str, str]]] = {
         "testing": ("flash", "high"),
         "fallback": ("flash", "high"),
     },
+    "codex": {
+        "planning": ("astra", "low"),
+        "hard_coding": ("sol", "high"),
+        "token_heavy_coding": ("sol", "high"),
+        "easy_coding": ("sol", "high"),
+        "testing": ("sol", "high"),
+        "fallback": ("sol", "high"),
+    },
 }
 ```
-Keep legacy keys `"claude-max"`, `"claude-pro"`, `"codex-pro"`, `"gemini-cli"` (keeping `"gemini-cli"` as `tier=2` for test compatibility), and add `"claude-opus"`, `"chatgpt-astra-sol"`, `"gemini-argon-flash"`, and `"mcp-ide"`.
+Keep legacy keys `"claude-max"`, `"claude-pro"`, `"codex-pro"`, `"gemini-cli"` (keeping `"gemini-cli"` as `tier=2` for test compatibility), and add `"claude-opus"`, `"gemini-argon-flash"`, `"chatgpt-astra-sol"`, and `"mcp-ide"`.
 
 ### 1.3 Edit `funguys/models.py`
 1. Add `SignalOp`, `AgentSignal`, `PromptQueueItem`, and `BlackboardEntry` models.
@@ -120,7 +120,7 @@ Remember: `runtime.py` MUST only import Python standard library modules at the t
 
 1. **Add Token-Heavy Task Detector & Model-Effort Selector**:
    ```python
-   PLANNER_PRIORITY = {'claude': 0, 'codex': 1, 'gemini': 2, 'mcp': 1, 'api': 3}
+   PLANNER_PRIORITY = {'claude': 0, 'gemini': 1, 'codex': 2, 'mcp': 1, 'api': 3}
 
    MODEL_POLICY = {
        'claude': {
@@ -131,14 +131,6 @@ Remember: `runtime.py` MUST only import Python standard library modules at the t
            'testing': ('opus', 'medium'),
            'fallback': ('opus', 'medium'),
        },
-       'codex': {
-           'planning': ('astra', 'medium'),
-           'hard_coding': ('sol', 'high'),
-           'token_heavy_coding': ('sol', 'high'),
-           'easy_coding': ('sol', 'high'),
-           'testing': ('sol', 'high'),
-           'fallback': ('sol', 'high'),
-       },
        'gemini': {
            'planning': ('argon', 'medium'),
            'hard_coding': ('argon', 'low'),
@@ -146,6 +138,14 @@ Remember: `runtime.py` MUST only import Python standard library modules at the t
            'easy_coding': ('argon', 'low'),
            'testing': ('flash', 'high'),
            'fallback': ('flash', 'high'),
+       },
+       'codex': {
+           'planning': ('astra', 'low'),
+           'hard_coding': ('sol', 'high'),
+           'token_heavy_coding': ('sol', 'high'),
+           'easy_coding': ('sol', 'high'),
+           'testing': ('sol', 'high'),
+           'fallback': ('sol', 'high'),
        },
    }
 
@@ -190,7 +190,7 @@ Remember: `runtime.py` MUST only import Python standard library modules at the t
                return ('flash', 'high')
            return ('argon', 'low')
        if provider == 'codex':
-           return ('astra', 'medium') if role == 'planning' else ('sol', 'high')
+           return ('astra', 'low') if role == 'planning' else ('sol', 'high')
        if provider == 'claude':
            if role in ('planning', 'hard_coding'):
                return ('opus', 'high')
@@ -227,15 +227,15 @@ Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_t
 
 ---
 
-## STEP 3: PLANNER PRIORITY (`OPUS HIGH` $\to$ `ASTRA MEDIUM` $\to$ `ARGON MEDIUM`) & WORK PARSING (`architect.py`, `adapters.py`, `app.py`)
+## STEP 3: PLANNER PRIORITY (`OPUS HIGH` $\to$ `ARGON MEDIUM` $\to$ `ASTRA LOW`) & WORK PARSING (`architect.py`, `adapters.py`, `app.py`)
 
 1. **Edit `funguys/worker/adapters.py` (`detect_available_clis`)**:
-   - Order CLI detection by usage rate priority:
+   - Order CLI detection by planning usage-rate priority:
      1. `claude` (`claude-pro`)
-     2. `codex` (`codex-pro`)
-     3. `gemini` / `agy` (`gemini-cli`)
+     2. `gemini` / `agy` (`gemini-cli`)
+     3. `codex` (`codex-pro`)
 2. **Edit `funguys/host/app.py` (`select_architect`)**:
-   - When `agent_id` is not explicitly specified (`Auto: idle local architect`), sort idle local architects by `(PLANNER_PROVIDER_PRIORITY.get(a.provider, 99), a.high_tier_used_pct, a.used_pct, a.tier)` so **Claude (`opus:high`) is ALWAYS selected first**, followed by **ChatGPT (`astra:medium`)**, and finally **Google (`argon:medium`)**:
+   - When `agent_id` is not explicitly specified (`Auto: idle local architect`), sort idle local architects by `(PLANNER_PROVIDER_PRIORITY.get(a.provider, 99), a.high_tier_used_pct, a.used_pct, a.tier)` so **Claude (`opus:high`) is ALWAYS selected first**, followed by **Google (`argon:medium`)**, and finally **ChatGPT (`astra:low`)**:
      ```python
      def select_architect(agent_id):
          from funguys.config import PLANNER_PROVIDER_PRIORITY
@@ -251,8 +251,8 @@ Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_t
          )
      ```
 3. **Edit `funguys/host/architect.py`**:
-   - Default `self.provider = "claude"` (falling back to `"codex"` then `"gemini"` based on `select_architect`).
-   - Pass `role='planning'` to `run_text_agent(self.provider, ..., role='planning')` so planning always uses `opus:high`, `astra:medium`, or `argon:medium`.
+   - Default `self.provider = "claude"` (falling back to `"gemini"` then `"codex"` based on `select_architect`).
+   - Pass `role='planning'` to `run_text_agent(self.provider, ..., role='planning')` so planning always uses `opus:high`, `argon:medium`, or `astra:low`.
    - In `compile_plan_and_tasks()`, instruct the planner to parse work into atomic 1–2 file tasks and separate `hard_coding`, `easy_coding`, and `testing` tasks so token-heavy and testing work is offloaded to high-usage-rate models (`sol:high`, `flash:high`, `opus:medium`).
 
 ---
@@ -269,7 +269,7 @@ Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_t
 
 ## STEP 5: MAIN CONTROLLER & USAGE-RATE-AWARE SCHEDULER (`funguys/host/orchestrator.py`)
 
-1. **Default Controller Selection Priority (`claude` $\to$ `codex` $\to$ `gemini`)**:
+1. **Default Controller Selection Priority (`claude` $\to$ `gemini` $\to$ `codex`)**:
    - When selecting or auto-assigning the Main Controller Agent (`designate_controller` / `_get_controller_agent`), rank candidates by `(PLANNER_PROVIDER_PRIORITY.get(a.provider, 99), a.high_tier_used_pct, a.used_pct)`.
 2. **Route Token-Heavy Tasks & Hard Coding by Usage Rate in `select_best_agent_for_task`**:
    ```python
@@ -288,7 +288,6 @@ Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_t
            return None
        if role == 'testing' or heavy:
            # Offload testing and token-heavy tasks to high-usage-rate models (sol:high, flash:high, opus:medium/high)
-           # Avoid draining Argon bucket on token-heavy tasks
            return min(
                pool,
                key=lambda a: (
@@ -300,8 +299,6 @@ Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_t
            )
        tier_matched = [a for a in pool if task.complexity_tier != 1 or a.tier == 1]
        candidates = tier_matched if tier_matched else pool
-       # For Tier 1 hard coding, prefer Claude (opus:high) and ChatGPT (sol:high) before Gemini (argon:low)
-       # so Argon's lower usage rate is conserved!
        return min(
            candidates,
            key=lambda a: (
@@ -313,9 +310,9 @@ Re-export `PLANNER_PRIORITY`, `MODEL_POLICY`, `is_token_heavy_task`, `classify_t
            ),
        )
    ```
-   *(Note: Verify against `test_plan_approval_gate_and_role_based_tier_routing`: `Alex` is `claude-max` (`tier=1`, `PLANNER_PROVIDER_PRIORITY['claude'] == 0`), `Sam` is `gemini-cli` (`tier=2`, `PLANNER_PROVIDER_PRIORITY['gemini'] == 2`). For `task-1-contracts` (`complexity_tier=1`, 1 target file `backend/service.py`), `Alex` is selected first, passing the test!)*
+   *(Note: Verify against `test_plan_approval_gate_and_role_based_tier_routing`: `Alex` is `claude-max` (`tier=1`, `PLANNER_PROVIDER_PRIORITY['claude'] == 0`), `Sam` is `gemini-cli` (`tier=2`, `PLANNER_PROVIDER_PRIORITY['gemini'] == 1`). For `task-1-contracts` (`complexity_tier=1`, 1 target file `backend/service.py`), `Alex` is selected first, passing the test!)*
 3. **Separate Bucket Accounting in `_finish_agent`**:
-   - High-tier models (`argon:medium`, `argon:low`, `astra:medium`, `opus:high`) increment `agent.high_tier_turns_used` and `agent.high_tier_used_pct`.
+   - High-tier models (`argon:medium`, `argon:low`, `astra:low`, `opus:high`) increment `agent.high_tier_turns_used` and `agent.high_tier_used_pct`.
    - High-usage-rate workhorse models (`flash:high`, `sol:high`, `opus:medium`) increment `agent.turns_used` and `agent.used_pct` without touching `high_tier_used_pct`.
 4. **Signal Processing (`process_signals`), `heartbeat`, `submit_task_work`, and `ask_project_question`**:
    - Implement `@FG:` signal handling (`CLAIM`, `RELEASE`, `FACT`, `TRIPWIRE`, `HOLD`, `GO`, `STEER`, `TRIGGER`, `VETO`) and inbox delivery as specified.

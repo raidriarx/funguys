@@ -6,8 +6,8 @@ The goal of this upgrade is to transform **FunGuys** from a static batch-task ru
 1. **AI agents can communicate, trigger each other, and queue/steer prompts** to any other agent mid-flight.
 2. **All coordination routes through One Main Controller Agent** (hub-and-spoke architecture) so agents never get stuck in chaotic N×N chat loops.
 3. **Usage-Rate Priority Routing (High-Allowance Models First)**:
-   - **Planning Priority Order**: Always defaults to **1st: Claude (`opus:high`) $\to$ 2nd: ChatGPT (`astra:medium`) $\to$ 3rd: Google (`argon:medium`)**, matching the exact order of how much usage rate each model has.
-   - **Token-Heavy Tasks Default to High-Usage-Rate Models**: Token-heavy coding, multi-file edits, retries, and all testing are automatically routed to high-usage-rate models (**`sol:high`**, **`flash:high`**, **`opus:high` / `opus:medium`**) so scarce rate-limited models (**`argon:medium`**, **`argon:low`**, **`astra:medium`**) never get drained by heavy token loads.
+   - **Planning Priority Order**: Always defaults to **1st: Claude (`opus:high`) $\to$ 2nd: Google (`argon:medium`) $\to$ 3rd: ChatGPT (`astra:low`)**, matching the exact order of how much usage rate each model has.
+   - **Token-Heavy Tasks Default to High-Usage-Rate Models**: Token-heavy coding, multi-file edits, retries, and all testing are automatically routed to high-usage-rate models (**`sol:high`**, **`flash:high`**, **`opus:high` / `opus:medium`**) so scarce rate-limited models (**`astra:low`**, **`argon:medium`**, **`argon:low`**) never get drained by heavy token loads.
 4. **Coordination uses the July 2026 ExploitGym / Hugging Face Swarm primitives**—stripped of cryptographic signatures (`Ed25519`) and folder-name encoding—leaving pure, telegraphic synchronization signals (`CLAIM`, `RELEASE`, `FACT`, `TRIPWIRE`, `TRIGGER`, `STEER`, `HOLD`, `GO`, `VETO`) and a **Shared Blackboard**.
 5. **Cross-Platform & Serverless Laptop Operation**: Works natively on **macOS, Windows, and Linux**, supports **Claude (`claude`), ChatGPT (`codex`), Google (`gemini`/`agy`), and IDE/Desktop AI apps** (Cursor, Windsurf, Antigravity, Claude Desktop, ChatGPT App), and runs **100% free on laptops using GitHub (`fg-c2` branch)** and free tunnels with zero paid servers.
 
@@ -18,18 +18,18 @@ The goal of this upgrade is to transform **FunGuys** from a static batch-task ru
 ### 2.1 Planning & Main Controller Priority Order
 When selecting the Lead Architect or Main Controller Agent across all connected machines, the Host always picks in order of **highest usage allowance**:
 1. **1st Choice — Claude `opus` (`high`)**: Highest usage rate for deep reasoning; also capable of hard coding.
-2. **2nd Choice — ChatGPT `astra` (`medium`)**: Used for planning if no idle Claude node is available.
-3. **3rd Choice — Google `argon` (`medium`)**: Tightest usage rate limit; used for planning only when neither Claude nor ChatGPT is available.
+2. **2nd Choice — Google `argon` (`medium`)**: Second-highest planning allowance; strictly reserved for planning/steering (no coding).
+3. **3rd Choice — ChatGPT `astra` (`low`)**: Tightest usage rate limit; used for planning only when neither Claude nor Google is available, at `low` effort to conserve Astra quota.
 
 ### 2.2 Per-Provider Model & Effort Table
-| Task Role | 1st Priority: Claude (`claude`) | 2nd Priority: ChatGPT (`codex`) | 3rd Priority: Google (`gemini` / `agy`) |
+| Task Role | 1st Priority: Claude (`claude`) | 2nd Priority: Google (`gemini` / `agy`) | 3rd Priority: ChatGPT (`codex`) |
 | :--- | :--- | :--- | :--- |
-| **1. Planning & Controller** *(Zero Coding)* | **`opus` (`high`)** *(1st Default)* | **`astra` (`medium`)** *(2nd Default)* | **`argon` (`medium`)** *(3rd Default)* |
-| **2. Hard Coding** *(Tier 1: Core/Backend)* | **`opus` (`high`)** | **`sol` (`high`)** | **`argon` (`low`)** *(only for compact tasks; heavy tasks & fallback use **`flash` (`high`)**)* |
-| **3. Token-Heavy Coding** *(Multi-file, large context, or retries)* | **`opus` (`high` / `medium`)** | **`sol` (`high`)** | **`flash` (`high`)** *(Protects Argon from high token burn)* |
-| **4. Easy Coding** *(Tier 2: UI/Wiring/Boilerplate)* | **`opus` (`medium`)** | **`sol` (`high`)** | **`argon` (`low`)** $\to$ **`flash` (`high`)** |
-| **5. Testing & QA** *(All test authoring & fixes)* | **`opus` (`medium`)** | **`sol` (`high`)** | **`flash` (`high`)** |
-| **Hard Floor** *(Never go lower than)* | **`opus` (`medium`)** | **`sol` (`high`)** | **`flash` (`high`)** |
+| **1. Planning & Controller** *(Zero Coding)* | **`opus` (`high`)** *(1st Default)* | **`argon` (`medium`)** *(2nd Default)* | **`astra` (`low`)** *(3rd Default)* |
+| **2. Hard Coding** *(Tier 1: Core/Backend)* | **`opus` (`high`)** | **`argon` (`low`)** *(compact tasks; heavy tasks & fallback use **`flash` (`high`)**)* | **`sol` (`high`)** *(Handles all coding so Astra is untouched)* |
+| **3. Token-Heavy Coding** *(Multi-file, large context, or retries)* | **`opus` (`high` / `medium`)** | **`flash` (`high`)** *(Protects Argon from high token burn)* | **`sol` (`high`)** |
+| **4. Easy Coding** *(Tier 2: UI/Wiring/Boilerplate)* | **`opus` (`medium`)** | **`argon` (`low`)** $\to$ **`flash` (`high`)** | **`sol` (`high`)** |
+| **5. Testing & QA** *(All test authoring & fixes)* | **`opus` (`medium`)** | **`flash` (`high`)** | **`sol` (`high`)** |
+| **Hard Floor** *(Never go lower than)* | **`opus` (`medium`)** | **`flash` (`high`)** | **`sol` (`high`)** |
 
 ### 2.3 How Token-Heavy Tasks & Separate Usage Buckets Are Managed
 1. **Automatic Token-Weight Scoring (`is_token_heavy_task`)**:
@@ -86,7 +86,7 @@ Instead of agents chatting in conversational paragraphs, agents communicate with
 | **`TRIGGER`** | `@FG:TRIGGER TARGET=role:testing TASK=task-3 :: Run unit tests on new auth module` | Asks the Main Controller to wake up a testing agent (`flash-high` / `sol-high` / `opus-medium`). | ~25 tokens |
 | **`STEER`** | `@FG:STEER TARGET=agent-abc TASK=task-2 :: Rename login() to authenticate()` | Queues a live steering instruction into another agent's `.funguys_inbox.md` without killing its process. | ~25 tokens |
 | **`HOLD` / `GO`** | `@FG:HOLD TASK=task-2 :: Waiting on schema migration` | Pauses or unblocks a downstream task/agent. | ~15 tokens |
-| **`VETO`** | `@FG:VETO TASK=task-1 :: Circular dependency in spec; need Controller redesign` | Halts a broken task approach and escalates to the Main Controller (`opus-high` $\to$ `astra-medium` $\to$ `argon-medium`). | ~20 tokens |
+| **`VETO`** | `@FG:VETO TASK=task-1 :: Circular dependency in spec; need Controller redesign` | Halts a broken task approach and escalates to the Main Controller (`opus-high` $\to$ `argon-medium` $\to$ `astra-low`). | ~20 tokens |
 
 ---
 
