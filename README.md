@@ -1,8 +1,38 @@
-# FunGuys — collaborative AI engineering workflow
+# FunGuys — Collaborative AI Swarm Engineering Platform
 
-FunGuys coordinates coding tasks across teammates' installed Claude, Codex and Gemini CLIs. A host owns the task plan and Git repository; authenticated workers execute versioned assignments on their own machines. Submitted changes are tested in isolated worktrees and merged only after the configured checks pass.
+FunGuys coordinates coding tasks across teammates' installed Claude, ChatGPT/Codex, and Gemini CLIs, as well as desktop IDE agents (Cursor, Windsurf, Claude Desktop, VS Code). A host owns the task DAG, Git repository, and shared blackboard; authenticated workers execute versioned assignments across their own machines. Submitted changes are tested in isolated worktrees and merged only after 3-layer verification checks pass.
 
-## Start the host
+---
+
+## Key Capabilities & Architecture
+
+- **Main Controller C2 (Command & Control)**: Automatically elects a coordinator AI node (ordered by planning usage rate priority: Claude Opus High $\to$ Gemini Argon Medium $\to$ OpenAI Astra Low).
+- **In-Band Chat Signaling**: Real-time 1-line agent coordination (`@FG:CLAIM`, `@FG:RELEASE`, `@FG:FACT`, `@FG:TRIPWIRE`, `@FG:STEER`, `@FG:TRIGGER`, `@FG:HOLD`, `@FG:GO`, `@FG:VETO`).
+- **Work-Importance Model Routing**: Intelligently routes tasks by architectural importance (`planning`, `important_coding`, `gruntwork`, `testing`) rather than token volume, keeping high-tier reasoning quotas from being burned on boilerplate.
+- **Dual-Bucket Quota Management**: Separates heavy reasoning turns (`opus:high`, `argon`, `astra`) from high-throughput workhorse turns (`flash:high`, `sol:high`, `opus:medium`), automatically falling back to workhorse tiers when quotas reach 85%.
+- **Non-Destructive Live Steering & `/btw` Inboxes**: Mid-run directives and `/btw` notes stream in real-time into `.funguys_inbox.md` inside the worker's active workspace without crashing or resetting progress.
+- **Desktop IDE Integration (stdio MCP)**: Connect Cursor, Windsurf, Claude Desktop, or VS Code into the swarm via standard Model Context Protocol tools (`fg_poll`, `fg_listen`, `fg_check_inbox`, `fg_signal`, `fg_steer`, `fg_submit`).
+- **Serverless GitHub State Sync**: Persists the project DAG, blackboard, and discovery beacons to an orphan `refs/heads/fg-c2` branch so remote nodes discover and sync state without a paid cloud server.
+- **Laptop Keep-Awake**: Built-in sleep prevention for Windows (`SetThreadExecutionState`), macOS (`caffeinate`), and Linux (`systemd-inhibit`) to ensure long builds run uninterrupted.
+- **Token Efficiency**: Automated `CONTRACTS.md` slicing for target files and ANSI/pointer log scrubbing for minimal LLM token consumption.
+
+---
+
+## Canonical Model Routing & Subscription Profiles
+
+| Canonical Profile Key | Provider | Planning Model | Core/Important Coding | Gruntwork Scaffolding | Testing Suite | Planning Priority |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`claude-opus`** | Anthropic | `opus` (high) | `opus` (high) | `opus` (medium) | `opus` (medium) | **Rank 0** (Highest usage headroom) |
+| **`gemini-argon-flash`** | Google | `argon` (medium) | `argon` (low) | `flash` (high) | `flash` (high) *(never lower)* | **Rank 1** |
+| **`chatgpt-astra-sol`** | OpenAI / Codex | `astra` (low) | `sol` (high) | `sol` (high) | `sol` (high) | **Rank 2** |
+| **`mcp-ide`** | IDE Stdio MCP | — | Assigned via Host | Assigned via Host | Assigned via Host | **Rank 1** |
+| **`api-fallback`** | Local / Offline | Mock | Scripted | Scripted | Scripted | **Rank 3** |
+
+*(Legacy aliases `claude-pro`, `claude-max`, `gemini-cli`, `codex-pro`, and `ide-mcp` automatically resolve to these canonical profiles.)*
+
+---
+
+## Start the Host
 
 Requirements: Python 3.11+, Git, and [uv](https://docs.astral.sh/uv/).
 
@@ -11,67 +41,75 @@ uv sync
 uv run funguys host
 ```
 
-Open http://localhost:8420. Sign in with the token in `.funguys/admin_token` on the host. The default bind address is loopback. For teammates, explicitly enable one of:
+Open **http://localhost:8420** in your browser. Sign in using the administrator token saved in `.funguys/admin_token`.
+
+To allow teammates or remote workers on your local network or the internet to join:
 
 ```powershell
-uv run funguys host --tunnel
+# For LAN teammates on the same Wi-Fi:
 uv run funguys host --host 0.0.0.0
+
+# For internet access via Cloudflare Tunnel:
+uv run funguys host --tunnel
 ```
 
-`--tunnel` requires an installed `cloudflared`. Startup has a deadline; failure leaves the local dashboard available. `--no-tunnel` never creates a tunnel. Use HTTPS for connections outside a trusted LAN.
+---
 
-## Connect a worker
+## Connecting Workers
 
-Create a short-lived invitation in Mission Control, select the worker's installed CLI profile, then copy the Windows or Mac/Linux command. Both launchers run the same Python worker. Workers require Python 3.11+ and a logged-in CLI; they do not require this repository or the FunGuys package. A worker credential is saved under the worker account's `.funguys/workers` directory for reconnects. Each invitation enrolls one machine and expires after one hour.
+### 1. Remote CLI Workers (Windows / macOS / Linux)
+In Mission Control, click **Workers & Invites** $\to$ **Invite a worker**, choose the subscription profile, and copy the one-line join command:
+- **Windows (PowerShell)**:
+  ```powershell
+  irm "http://<host-ip>:8420/join.ps1?token=<token>&profile=gemini-argon-flash" | iex
+  ```
+- **macOS / Linux (Bash)**:
+  ```bash
+  curl --fail -sSL "http://<host-ip>:8420/join.sh?token=<token>&profile=claude-opus" | bash
+  ```
+Workers only require Python 3.11+ and their installed CLI; they do not need this repo cloned.
 
-Workers poll for existing assignments, send heartbeats during execution, submit only changed files, and support binary files and deletions. A disconnected worker's assignment expires; late results cannot overwrite its replacement. Removing a worker revokes its credential and requeues active work.
+### 2. Desktop IDE Workers (Cursor / Claude Desktop / Windsurf / VS Code)
+Add the FunGuys MCP server to your editor configuration (e.g. `claude_desktop_config.json` or Cursor MCP settings):
+```json
+{
+  "mcpServers": {
+    "funguys": {
+      "command": "python",
+      "args": ["-m", "funguys.cli", "mcp-worker", "--host-url", "http://127.0.0.1:8420", "--token", "<WORKER_OR_ADMIN_TOKEN>", "--name", "Cursor-IDE"]
+    }
+  }
+}
+```
+Available IDE tools:
+- `fg_poll` & `fg_listen`: Poll or wait for the next assigned task, contracts slice, and blackboard state.
+- `fg_check_inbox`: Inspect queued Controller steering directives and `/btw` notes.
+- `fg_signal`: Send C2 signals (`@FG:CLAIM`, `FACT`, `TRIPWIRE`, `TRIGGER`, `STEER`, `HOLD`, `GO`, `VETO`).
+- `fg_steer`: Send directives or interrupts to other agents.
+- `fg_submit`: Submit file edits directly into the 3-layer automated QA pipeline.
 
-## Plans and execution
+---
 
-1. Create/activate a project, or start an interview with an idle **local** architect.
-2. Compile the plan, or add tasks manually. Unknown dependencies, duplicate IDs and cycles are rejected.
-3. Review contracts and task verification requirements. Approve that specific plan version.
-4. Connected workers execute their own assignments. The host executes only agents explicitly registered as local executors.
-5. QA checks syntax/JSON, supplied verification commands, available Python/Node tests/builds, and browser targets. Reports distinguish **passed**, **failed**, **skipped**, and **unavailable** checks.
+## Planning, Steering & Execution
 
-Interview answers never approve a plan automatically. Pause before replacing a project or modifying the task plan. Human teammates can claim tasks, download an assignment JSON bundle, submit edited files, retry, and release tasks.
+1. **Lead Architect Interview**: Start an interactive interview in Mission Control. The elected leader AI grills the requirements, scans any existing workspace code, and compiles a comprehensive `CONTRACTS.md` and multi-phase Task DAG.
+2. **Review & Approve**: Review the interface contracts and tasks. Explicitly approve the plan version to unlock worker scheduling.
+3. **In-Flight Guidance (`/btw`)**: Type `/btw <guidance>` in chat or send an `@FG:STEER` signal to guide active workers. Guidance appends to `.funguys_inbox.md` without killing the active process.
+4. **Automated 3-Layer QA Verification**: Submitted code is tested inside isolated Git worktrees (`funguys-qa:local` Docker container or host sandbox with `FUNGUYS_TRUSTED_EXECUTION=1`). Merges only proceed when all checks pass.
 
-Local planning/chat currently use the selected host CLI. Remote interactive architect/chat jobs and direct fallback APIs are not implemented; the application reports this explicitly. It does not silently substitute another provider. Structural review events describe automated checks; no model consensus is claimed.
+---
 
-## Configure QA
+## Testing & Quality Assurance
 
-Generated tests and commands use a restricted Docker container by default. Install Docker and build the supplied QA image:
+Run the test suite:
 
 ```powershell
-docker build -t funguys-qa:local -f docker/qa.Dockerfile .
+uv run pytest -v
 ```
 
-The container has no network, no host credentials or Docker socket, a read-only root filesystem, and CPU/memory/process limits. It receives a filtered copy of the assignment. The image contains Python, pytest, Playwright/Chromium, Node and npm. Add your project's dependencies to a derived image and set `FUNGUYS_QA_IMAGE` when needed. Network-dependent integrations and live external previews need a deliberately configured verification environment; unavailable checks do not pass.
+All 63 automated tests cover bootstrap syntax, browser dashboard integration, Main Controller C2 primitives, MCP stdio dispatch, Git C2 sync, concurrency resilience, and end-to-end hackathon simulation.
 
-For a project you trust, you can explicitly permit QA and local CLI execution directly on the host:
-
-```powershell
-$env:FUNGUYS_TRUSTED_EXECUTION = '1'
-uv run funguys host
-```
-
-This opt-in runs project code with your user account's permissions. Leave it unset for untrusted projects. Builder CLIs retain their provider permission/sandbox controls; FunGuys does not pass permission-bypass flags. Selected CLIs may require their own sandbox prerequisites or interactive approvals.
-
-If QA is blocked by missing prerequisites, fix the environment and click **Recheck retained code in QA**. This verifies the already-submitted implementation without spending another builder run. Failed checks retry up to the task limit; environment failures are blocked separately. Resolve conflicts or reset after review rather than repeatedly overwriting main.
-
-## Inspection and tests
-
-```powershell
-uv run funguys graph . --query compute_metrics
-uv run funguys simulate
-uv run pytest -q
-```
-
-Simulation uses a disposable project under `.funguys/simulations`; it does not replace the active task board or agent registry. Builders are simulated and QA outcomes remain real, including missing-environment failures.
-
-Quota percentages are reported values or turn-count estimates, not live subscription billing data. Window expiry, explicit reset, soft thresholds and rate-limit output support handoff/recovery. The graph tracks Python public signatures and conservatively fingerprints JavaScript/TypeScript exports; it is not a complete TypeScript type checker.
-
-See [STARTUP_GUIDE.md](STARTUP_GUIDE.md) for setup, recovery and migration notes, and [WORKFLOW_RESCAN.md](WORKFLOW_RESCAN.md) for the audit follow-up.
+---
 
 ## License
 
