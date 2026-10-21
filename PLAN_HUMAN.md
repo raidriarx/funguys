@@ -5,39 +5,46 @@
 The goal of this upgrade is to transform **FunGuys** from a static batch-task runner into a **token-efficient, multi-agent command-and-control (C2) coordination network** where:
 1. **AI agents can communicate, trigger each other, and queue/steer prompts** to any other agent mid-flight.
 2. **All coordination routes through One Main Controller Agent** (hub-and-spoke architecture) so agents never get stuck in chaotic N×N chat loops.
-3. **Strict Model & Reasoning-Effort Routing + Separate Quota Buckets**:
-   - Protects scarce high-tier model buckets (**Argon** on Google, **Astra** on ChatGPT, **Opus High** on Claude) by strictly parsing out work by role (**Planning Only** vs. **Hard Coding** vs. **Easy Coding** vs. **Testing**) and never dropping below the minimum quality floor (**Flash High**, **Sol High**, **Opus Medium**).
+3. **Usage-Rate Priority Routing (High-Allowance Models First)**:
+   - **Planning Priority Order**: Always defaults to **1st: Claude (`opus:high`) $\to$ 2nd: ChatGPT (`astra:medium`) $\to$ 3rd: Google (`argon:medium`)**, matching the exact order of how much usage rate each model has.
+   - **Token-Heavy Tasks Default to High-Usage-Rate Models**: Token-heavy coding, multi-file edits, retries, and all testing are automatically routed to high-usage-rate models (**`sol:high`**, **`flash:high`**, **`opus:high` / `opus:medium`**) so scarce rate-limited models (**`argon:medium`**, **`argon:low`**, **`astra:medium`**) never get drained by heavy token loads.
 4. **Coordination uses the July 2026 ExploitGym / Hugging Face Swarm primitives**—stripped of cryptographic signatures (`Ed25519`) and folder-name encoding—leaving pure, telegraphic synchronization signals (`CLAIM`, `RELEASE`, `FACT`, `TRIPWIRE`, `TRIGGER`, `STEER`, `HOLD`, `GO`, `VETO`) and a **Shared Blackboard**.
-5. **Cross-Platform & Serverless Laptop Operation**: Works natively on **macOS, Windows, and Linux**, supports **Google (`gemini`/`agy`), ChatGPT (`codex`), Claude (`claude`), and IDE/Desktop AI apps** (Cursor, Windsurf, Antigravity, Claude Desktop, ChatGPT App), and runs **100% free on laptops using GitHub (`fg-c2` branch)** and free tunnels with zero paid servers.
+5. **Cross-Platform & Serverless Laptop Operation**: Works natively on **macOS, Windows, and Linux**, supports **Claude (`claude`), ChatGPT (`codex`), Google (`gemini`/`agy`), and IDE/Desktop AI apps** (Cursor, Windsurf, Antigravity, Claude Desktop, ChatGPT App), and runs **100% free on laptops using GitHub (`fg-c2` branch)** and free tunnels with zero paid servers.
 
 ---
 
-## 2. Model & Effort Routing Matrix (Quota-Aware Tiering)
+## 2. Model & Usage-Rate Routing Matrix
 
-Each provider enforces a strict **Role-to-Model-Effort policy** when booting up a CLI window or dispatching a task, with **separate usage-bucket tracking** so high-tier models never get wasted on routine work or testing:
+### 2.1 Planning & Main Controller Priority Order
+When selecting the Lead Architect or Main Controller Agent across all connected machines, the Host always picks in order of **highest usage allowance**:
+1. **1st Choice — Claude `opus` (`high`)**: Highest usage rate for deep reasoning; also capable of hard coding.
+2. **2nd Choice — ChatGPT `astra` (`medium`)**: Used for planning if no idle Claude node is available.
+3. **3rd Choice — Google `argon` (`medium`)**: Tightest usage rate limit; used for planning only when neither Claude nor ChatGPT is available.
 
-| Task Role | Google (`gemini` / `agy`) | OpenAI / ChatGPT (`codex`) | Anthropic (`claude`) |
+### 2.2 Per-Provider Model & Effort Table
+| Task Role | 1st Priority: Claude (`claude`) | 2nd Priority: ChatGPT (`codex`) | 3rd Priority: Google (`gemini` / `agy`) |
 | :--- | :--- | :--- | :--- |
-| **1. Planning & Controller Only** *(Zero Coding)* | **`argon` (`medium`)**<br>*(Highest allowed; strictly NO coding)* | **`astra` (`medium`)**<br>*(Highest allowed; strictly NO coding)* | **`opus` (`high`)** |
-| **2. Hard Coding** *(Tier 1: Core/Backend/Algorithms)* | **`argon` (`low`)**<br>*(Auto-fallbacks to **`flash` (`high`)** if Argon bucket runs out)* | **`sol` (`high`)**<br>*(Handles all coding so Astra never runs out)* | **`opus` (`high`)** |
-| **3. Easy Coding** *(Tier 2: UI/Wiring/Boilerplate)* | **`argon` (`low`)** -> **`flash` (`high`)**<br>*(Shifts to `flash-high` early at 60% Argon usage to preserve Argon)* | **`sol` (`high`)** | **`opus` (`medium`)** |
-| **4. Testing & QA** *(All test authoring & fixes)* | **`flash` (`high`)**<br>*(100% isolated from Argon bucket)* | **`sol` (`high`)** | **`opus` (`medium`)** |
-| **Hard Floor** *(Never go lower than)* | **`flash` (`high`)** | **`sol` (`high`)** | **`opus` (`medium`)** |
+| **1. Planning & Controller** *(Zero Coding)* | **`opus` (`high`)** *(1st Default)* | **`astra` (`medium`)** *(2nd Default)* | **`argon` (`medium`)** *(3rd Default)* |
+| **2. Hard Coding** *(Tier 1: Core/Backend)* | **`opus` (`high`)** | **`sol` (`high`)** | **`argon` (`low`)** *(only for compact tasks; heavy tasks & fallback use **`flash` (`high`)**)* |
+| **3. Token-Heavy Coding** *(Multi-file, large context, or retries)* | **`opus` (`high` / `medium`)** | **`sol` (`high`)** | **`flash` (`high`)** *(Protects Argon from high token burn)* |
+| **4. Easy Coding** *(Tier 2: UI/Wiring/Boilerplate)* | **`opus` (`medium`)** | **`sol` (`high`)** | **`argon` (`low`)** $\to$ **`flash` (`high`)** |
+| **5. Testing & QA** *(All test authoring & fixes)* | **`opus` (`medium`)** | **`sol` (`high`)** | **`flash` (`high`)** |
+| **Hard Floor** *(Never go lower than)* | **`opus` (`medium`)** | **`sol` (`high`)** | **`flash` (`high`)** |
 
-### How We Keep Argon (and Astra) From Running Out
-1. **Dual-Bucket Usage Tracking (`featured_used_pct` vs. `standard_used_pct`)**:
-   - **Argon** (`argon-medium` + `argon-low`) runs on a separate usage rate from **Flash** (`flash-high`). Likewise, **Astra** (`astra-medium`) runs on a separate usage rate from **Sol** (`sol-high`).
-   - The Host tracks both buckets separately per worker.
-2. **Hard Ban on Coding with `argon-medium` or `astra-medium`**:
-   - `argon-medium` and `astra-medium` are **only** booted for Planning (`GrillArchitectEngine`) and Main Controller arbitration (`_consult_controller_agent`). They are never assigned file-editing tasks.
-3. **Reserved Planning Buffer + Seamless In-Task Fallback (`argon-low` $\to$ `flash-high`)**:
-   - For Google workers:
-     - **0%–60% Argon Usage**: `argon-low` handles both Hard Coding and Easy Coding; `flash-high` handles all Testing.
-     - **60%–85% Argon Usage**: Easy Coding automatically shifts to `flash-high`; `argon-low` is reserved only for Hard Coding (`complexity_tier == 1`).
-     - **85%–100% Argon Usage (or Argon 429 Rate Limit)**: The remaining 15% of the Argon bucket is locked exclusively for `argon-medium` planning/steering. **All** coding tasks automatically boot with `flash-high`—and if `argon-low` hits a rate limit mid-run, the worker catches it and retries in-place with `flash-high` instead of failing the task!
-4. **Fine-Grained Work Parsing (Micro-Task Decomposition)**:
-   - Multi-file monolithic tasks burn through Argon's rate limit because the CLI loops 15+ times in a single session.
-   - The Planner (`argon-medium` / `astra-medium` / `opus-high`) is instructed to **parse work into atomic 1–2 file tasks** and **always split Tests into dedicated `role="testing"` tasks** (`complexity_tier=2, require_tests=True`) so test writing and debugging are 100% offloaded to `flash-high`, `sol-high`, and `opus-medium`.
+### 2.3 How Token-Heavy Tasks & Separate Usage Buckets Are Managed
+1. **Automatic Token-Weight Scoring (`is_token_heavy_task`)**:
+   - Before dispatching a task, the Host calculates its token weight based on:
+     - Number of `target_files` ($\ge 3$ files = heavy)
+     - Total byte size of existing `target_files` ($> 12\text{ KB}$ = heavy)
+     - Retry status (`retry_count >= 1` with QA logs = heavy)
+     - Testing requirement (`require_tests == True` = heavy tool-loop count)
+   - **Rule**: Any task flagged as `token_heavy` is routed to high-usage-rate models (**`sol:high`**, **`flash:high`**, or **`opus:high`/`opus:medium`**) and **never** assigned to `argon:low` unless forced by fallback to `flash:high`.
+2. **Cross-Provider Task Assignment Priority**:
+   - For **Hard Coding (`complexity_tier == 1`)**: Prefer **Claude (`opus:high`)** or **ChatGPT (`sol:high`)** before **Google (`argon:low`)** so Argon's tight rate limit is spared whenever Claude or ChatGPT workers are available.
+   - For **Token-Heavy & Testing Tasks**: Prefer high-throughput pools (**`flash:high`**, **`sol:high`**, **`opus:medium`**).
+3. **Dual-Bucket Usage Tracking & In-Place Fallback (`argon-low` $\to$ `flash-high`)**:
+   - Tracks `high_tier_used_pct` (Argon / Astra / Opus-High bucket) separately from `used_pct` (Flash-High / Sol-High / Opus-Medium bucket).
+   - If `argon-low` hits a rate limit (`429`) mid-task or `high_tier_used_pct >= 60%` on a medium/heavy task, the worker immediately switches to `flash-high` in-place without failing the task.
 
 ---
 
@@ -47,19 +54,19 @@ Upon re-auditing the plan against the repository's 55-test regression suite (`te
 
 1. **Standalone `/worker.py` Single-File Constraint (`funguys/worker/runtime.py`)**:
    - *Trap*: Remote workers join via `/join.ps1` or `/join.sh` by downloading **only** `funguys/worker/runtime.py` (`/worker.py`) and running it with standard-library Python—without the `funguys` package installed. If `runtime.py` imported `from funguys.protocol import ...`, standalone workers on other laptops would crash with `ModuleNotFoundError`.
-   - *Correction*: All core wire-protocol parsing (`parse_raw_signals`), model-flag resolution (`resolve_model_and_effort`), error compression (`compress_error_log`), and compact prompt building (`task_prompt`) are implemented directly inside `funguys/worker/runtime.py` using 100% Python standard library, and re-exported by `funguys/protocol.py` for the Host.
+   - *Correction*: All core wire-protocol parsing (`parse_raw_signals`), model-tier resolution (`select_model_and_effort`), error compression (`compress_error_log`), and compact prompt building (`task_prompt`) are implemented directly inside `funguys/worker/runtime.py` using 100% Python standard library, and re-exported by `funguys/protocol.py` for the Host.
 2. **Tier-Routing Test Compatibility (`funguys/config.py` & `funguys/host/orchestrator.py`)**:
-   - *Trap*: `test_plan_approval_gate_and_role_based_tier_routing` registers `claude-max` (Tier 1, 50% used) and `gemini-cli` (Tier 2, 10% used) and asserts that a Tier-1 task routes to `claude-max`. Changing `gemini-cli` to `tier=1` would cause `gemini-cli` to win that task and break the test.
-   - *Correction*: Keep the legacy profile key `gemini-cli` as `tier=2` for backward compatibility with existing tests, add the new profiles (`gemini-argon`, `chatgpt-astra-sol`, `claude-opus`), and update `select_best_agent_for_task()` so Tier-1 tasks prefer Tier-1 agents when available, and automatically fall back to Tier-2 agents (or `flash-high` / `sol-high`) if no idle Tier-1 agent is available.
+   - *Trap*: `test_plan_approval_gate_and_role_based_tier_routing` registers `claude-max` (Tier 1, 50% used) and `gemini-cli` (Tier 2, 10% used) and asserts that a Tier-1 task routes to `claude-max`.
+   - *Correction*: Ranking **Claude (`opus:high`) > ChatGPT (`sol:high`) > Google (`argon:low` / `flash:high`)** naturally routes Tier-1 tasks to `claude-max` first while allowing fallback to other providers when Claude is absent.
 3. **Preserving Test Fixtures (`funguys/host/demo.py`, `adapters.py`, `mcp_bridge/server.py`)**:
-   - *Trap*: Existing tests (`test_orchestrator_e2e.py`, `test_workflow_regressions.py`, `test_concurrency_recovery.py`) explicitly import `generate_task_code_artifact`, `/api/simulate/hackathon`, `public_destination`, and `fetch_public_page`. Deleting them would break 4 regression tests.
-   - *Correction*: Keep those functions in place (they use 0 LLM tokens at runtime since they are only called by tests/simulations) and add the new `MCPWorkerServer` alongside them in `funguys/mcp_bridge/server.py`.
+   - *Trap*: Existing tests (`test_orchestrator_e2e.py`, `test_workflow_regressions.py`, `test_concurrency_recovery.py`) explicitly import `generate_task_code_artifact`, `/api/simulate/hackathon`, `public_destination`, and `fetch_public_page`.
+   - *Correction*: Keep those functions in place (they use 0 LLM tokens at runtime) and add the new `MCPWorkerServer` alongside them in `funguys/mcp_bridge/server.py`.
 4. **Host HTTP Middleware Worker Permissions (`funguys/host/app.py:228`)**:
-   - *Trap*: `app.py` has a strict allowlist of URL paths that `role == 'worker'` tokens can call. New endpoints (`/api/controller/signal` and `/api/blackboard`) would return `403 Forbidden` to workers unless added to the middleware allowlist.
+   - *Trap*: `app.py` has a strict allowlist of URL paths that `role == 'worker'` tokens can call.
    - *Correction*: Explicitly add `/api/controller/signal` and `/api/blackboard` to the worker path allowlist in `authorize()`.
 5. **`/btw` Side Conversation Regression Compatibility (`funguys/host/orchestrator.py:728`)**:
    - *Trap*: `test_btw_side_conversation_lifecycle_and_guidance` monkeypatches `adapters.run_text_agent` and tests `/api/chat/ask` with a remote worker record.
-   - *Correction*: When `/btw` or `/api/chat/ask` is called, **both** enqueue the `PromptQueueItem` into the worker's live inbox (`store.enqueue_prompt`) **and** attempt `run_text_agent` (catching `RuntimeError` if the CLI isn't installed locally on the host and returning a clean `[Queued to worker inbox]` confirmation instead of crashing).
+   - *Correction*: When `/btw` or `/api/chat/ask` is called, **both** enqueue the `PromptQueueItem` into the worker's live inbox (`store.enqueue_prompt`) **and** attempt `run_text_agent` inside a `try/except` fallback.
 6. **Playwright QA Check Compatibility (`funguys/host/qa_pipeline.py:176`)**:
    - *Trap*: `test_browser_failure_is_not_a_pass_and_checks_are_honest` calls `_run_playwright_check(task, 1, 'http://127.0.0.1:1/missing')` on a task where `require_browser=False`.
    - *Correction*: Always run Playwright if `live_preview_url` is explicitly provided OR `task.require_browser` is `True` OR any file in `task.target_files` is an HTML/frontend file; only skip when `not live_preview_url and not task.require_browser` and the task only targets backend files.
@@ -76,16 +83,10 @@ Instead of agents chatting in conversational paragraphs, agents communicate with
 | **`RELEASE`** | `@FG:RELEASE :: *` | Releases file locks held by the agent. | ~5 tokens |
 | **`FACT`** | `@FG:FACT :: api:auth_header=X-Token` | Posts a shared discovery to the Blackboard so other agents don't waste turns rediscovering it. | ~15 tokens |
 | **`TRIPWIRE`** | `@FG:TRIPWIRE :: build:vitest needs --run flag` | Warns all agents of a dead-end or environment trap. | ~15 tokens |
-| **`TRIGGER`** | `@FG:TRIGGER TARGET=role:testing TASK=task-3 :: Run unit tests on new auth module` | Asks the Main Controller to wake up another agent (`flash-high` / `sol-high` / `opus-medium`) to run tests or follow-up tasks. | ~25 tokens |
+| **`TRIGGER`** | `@FG:TRIGGER TARGET=role:testing TASK=task-3 :: Run unit tests on new auth module` | Asks the Main Controller to wake up a testing agent (`flash-high` / `sol-high` / `opus-medium`). | ~25 tokens |
 | **`STEER`** | `@FG:STEER TARGET=agent-abc TASK=task-2 :: Rename login() to authenticate()` | Queues a live steering instruction into another agent's `.funguys_inbox.md` without killing its process. | ~25 tokens |
 | **`HOLD` / `GO`** | `@FG:HOLD TASK=task-2 :: Waiting on schema migration` | Pauses or unblocks a downstream task/agent. | ~15 tokens |
-| **`VETO`** | `@FG:VETO TASK=task-1 :: Circular dependency in spec; need Controller redesign` | Halts a broken task approach and escalates to the Main Controller (`argon-medium` / `astra-medium` / `opus-high`). | ~20 tokens |
-
-### Two-Layer Main Controller (Saving 90% of Controller Quota)
-- **Layer 1: Deterministic Python Switchboard (0 Tokens)**:
-  - Automatically processes `CLAIM`, `RELEASE`, `FACT`, `TRIPWIRE`, `HOLD`, `GO`, and direct `STEER`/`TRIGGER` routing in <5ms using zero LLM calls.
-- **Layer 2: Controller LLM Arbitration (`argon-medium` / `astra-medium` / `opus-high`)**:
-  - Only wakes the designated Main Controller LLM when a `VETO`, `BLOCKED_CIRCUIT_BREAKER`, or ambiguous `TRIGGER` occurs.
+| **`VETO`** | `@FG:VETO TASK=task-1 :: Circular dependency in spec; need Controller redesign` | Halts a broken task approach and escalates to the Main Controller (`opus-high` $\to$ `astra-medium` $\to$ `argon-medium`). | ~20 tokens |
 
 ---
 
