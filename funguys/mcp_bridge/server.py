@@ -126,15 +126,42 @@ MCP_TOOLS = [
     },
     {
         "name": "fg_signal",
-        "description": "Emit a 1-line C2 coordination signal (CLAIM, RELEASE, FACT, TRIPWIRE, TRIGGER, STEER, HOLD, GO, VETO) to the Main Controller and shared blackboard.",
+        "description": "Emit a 1-line C2 coordination signal (CLAIM, RELEASE, FACT, TRIPWIRE, TRIGGER, STEER, HOLD, GO, VETO, DISPUTE, HANDOFF) to the Main Controller and shared blackboard.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "op": {"type": "string", "description": "CLAIM | RELEASE | FACT | TRIPWIRE | TRIGGER | STEER | HOLD | GO | VETO"},
+                "op": {"type": "string", "description": "CLAIM | RELEASE | FACT | TRIPWIRE | TRIGGER | STEER | HOLD | GO | VETO | DISPUTE | HANDOFF"},
                 "target": {"type": "string", "description": "File path, fact key, task_id, or target agent_id"},
                 "payload": {"type": "string", "description": "Short fact value, steering message, or preferred agent_id"},
             },
             "required": ["op", "target"],
+        },
+    },
+    {
+        "name": "fg_dispute",
+        "description": "Escalate a contract contradiction, locked dependency, or cross-task conflict to the Main Controller for arbitration.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Conflicting file path, module, or task_id"},
+                "reason": {"type": "string", "description": "Description of the contract mismatch or dispute"},
+                "task_id": {"type": "string"},
+            },
+            "required": ["target", "reason"],
+        },
+    },
+    {
+        "name": "fg_handoff",
+        "description": "Trigger an on-demand context window reset and WIP baton-pass handoff for an agent without quota cooldown.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "Agent ID to reset and hand off (defaults to self)"},
+                "target_agent_id": {"type": "string", "description": "Optional preferred successor agent_id"},
+                "handoff_notes": {"type": "string", "description": "Baton-pass summary for the next agent"},
+                "wip_files": {"type": "object", "description": "Optional map of uncommitted WIP file paths -> UTF-8 content"},
+            },
+            "required": [],
         },
     },
     {
@@ -243,6 +270,28 @@ class MCPWorkerServer:
                             "payload": arguments.get("payload", ""),
                         }
                     ],
+                },
+            )
+        if name == "fg_dispute":
+            return self._request(
+                "POST",
+                "/api/controller/arbitrate",
+                {
+                    "sender_agent_id": agent_id,
+                    "target": arguments["target"],
+                    "reason": arguments["reason"],
+                    "task_id": arguments.get("task_id"),
+                },
+            )
+        if name == "fg_handoff":
+            target_agent = arguments.get("agent_id") or agent_id
+            return self._request(
+                "POST",
+                f"/api/agents/{target_agent}/handoff",
+                {
+                    "target_agent_id": arguments.get("target_agent_id"),
+                    "handoff_notes": arguments.get("handoff_notes", "MCP on-demand context reset & handoff"),
+                    "wip_files": arguments.get("wip_files", {}),
                 },
             )
         if name == "fg_steer":

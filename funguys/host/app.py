@@ -19,7 +19,7 @@ from funguys.files import bundle, source_files, validate_dag, runtime_directory
 from funguys.host.orchestrator import FunGuysOrchestrator, ConflictError
 from funguys.host.security import AccessControl
 from funguys.host.tunnel import get_lan_ip
-from funguys.models import ApprovePlanRequest, ClaimTaskHumanRequest, CreateProjectRequest, RegisterAgentRequest, ReportQuotaRequest, TaskItem, TaskStatus
+from funguys.models import ApprovePlanRequest, ArbitrateDisputeRequest, ClaimTaskHumanRequest, CreateProjectRequest, HandoffAgentRequest, RegisterAgentRequest, ReportQuotaRequest, TaskItem, TaskStatus
 
 class SubmitTaskRequest(BaseModel):
     agent_id: Optional[str] = None
@@ -46,7 +46,7 @@ class ControllerSignalRequest(BaseModel):
 
 class SteerAgentRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
-    mode: Literal['queue', 'steer', 'interrupt'] = 'steer'
+    mode: Literal['queue', 'steer', 'interrupt', 'handoff'] = 'steer'
     task_id: Optional[str] = None
     sender_agent_id: str = 'controller'
 
@@ -252,9 +252,9 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
                     or (
                         identity['role'] == 'worker'
                         and (
-                            path in ('/api/worker/assignment', '/api/workspace/snapshot', '/api/controller/signal', '/api/blackboard')
+                            path in ('/api/worker/assignment', '/api/workspace/snapshot', '/api/controller/signal', '/api/controller/arbitrate', '/api/blackboard')
                             or (path.startswith('/api/tasks/') and path.endswith(('/submit', '/execution-failed')))
-                            or (path.startswith('/api/agents/') and path.endswith('/steer'))
+                            or (path.startswith('/api/agents/') and path.endswith(('/steer', '/handoff')))
                             or path == f"/api/agents/{identity['agent_id']}/heartbeat"
                             or path == f"/api/agents/{identity['agent_id']}/quota"
                         )
@@ -394,6 +394,16 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         await sync()
         return result
 
+    @app.post('/api/agents/{agent_id}/handoff')
+    async def handoff_agent(agent_id:str, req:HandoffAgentRequest, request:Request):
+        if request.state.identity['role'] != 'admin' and request.state.identity['agent_id'] != agent_id:
+            caller = store.get_agent(request.state.identity.get('agent_id') or '')
+            if not caller or not caller.is_controller:
+                raise HTTPException(403, 'Only administrator, controller, or the assigned worker can trigger handoff')
+        result = await orch.handoff_agent_task(agent_id, **req.model_dump())
+        await sync()
+        return result
+
     @app.post('/api/agents/{agent_id}/controller')
     async def set_controller(agent_id:str):
         agent = await orch.designate_controller(agent_id)
@@ -423,6 +433,20 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         result = await orch.process_signals(sender, [s.model_dump() for s in req.signals])
         await sync()
         return {'processed': result}
+
+    @app.post('/api/controller/arbitrate')
+    async def controller_arbitrate(req:ArbitrateDisputeRequest, request:Request):
+        sender = req.sender_agent_id
+        if request.state.identity['role'] == 'worker':
+            sender = request.state.identity['agent_id']
+        result = await orch.arbitrate_dispute(
+            sender_agent_id=sender,
+            target=req.target,
+            reason=req.reason,
+            task_id=req.task_id,
+        )
+        await sync()
+        return result
 
     @app.get('/api/blackboard')
     async def get_blackboard():
@@ -549,6 +573,26 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         temporary.write_text(grill.session.model_dump_json(indent=2),encoding='utf-8')
         temporary.replace(session_file)
 
+    async def prepare_architect(agent_id):
+        agents = store.list_agents()
+        candidate = (
+            next((a for a in agents if a.id == agent_id), None)
+            if agent_id
+            else min(
+                (a for a in agents if a.executor == 'local' and a.id not in orch._consulting_agents),
+                key=lambda a: (a.status.value != 'idle', not a.is_controller, PLANNER_PROVIDER_PRIORITY.get(a.provider, 9), a.high_tier_used_pct, a.tier),
+                default=None,
+            )
+        )
+        if candidate and candidate.executor == 'local' and candidate.current_task_id and candidate.id not in orch._consulting_agents:
+            await orch.drop_task_for_controller(
+                candidate.id,
+                reason='Controller needed for Lead Architect planning; WIP checkpointed.',
+                schedule_immediately=False,
+                allow_self_reclaim=False,
+            )
+        return select_architect(agent_id)
+
     def select_architect(agent_id):
         agents = store.list_agents()
         # Planning priority: 1st Claude (Opus High) -> 2nd Gemini (Argon Med) -> 3rd OpenAI (Astra Low)
@@ -590,7 +634,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
 
     @app.post('/api/grill/start',dependencies=[Depends(project_mutation)])
     async def start_grill(req:StartGrillRequest):
-        selected = select_architect(req.lead_architect_agent_id)
+        selected = await prepare_architect(req.lead_architect_agent_id)
         current = store.get_project()
         requested = Path(req.workspace_path).resolve() if req.workspace_path else None
         if req.continue_existing and (not requested or requested==Path(current.workspace_path).resolve()):
@@ -612,7 +656,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
     async def answer_grill(req:AnswerGrillRequest):
         if grill.session.status!='grilling':
             raise ConflictError('Start an interview before submitting answers')
-        select_architect(grill.session.lead_architect_agent_id)
+        await prepare_architect(grill.session.lead_architect_agent_id)
         await planning_call(grill.submit_answer,req.answer)
         await sync()
         return state()
@@ -621,7 +665,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
     async def compile_grill():
         if grill.session.status!='grilling':
             raise ConflictError('Start an interview before compiling a plan')
-        select_architect(grill.session.lead_architect_agent_id)
+        await prepare_architect(grill.session.lead_architect_agent_id)
         existing = store.list_tasks()
         draft = await planning_call(grill.compile_plan_and_tasks,[orch.public_agent(a) for a in store.list_agents()],existing)
         tasks = draft['tasks']

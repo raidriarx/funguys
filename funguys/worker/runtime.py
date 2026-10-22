@@ -53,7 +53,7 @@ MODEL_POLICY = {
 }
 
 SIGNAL_PATTERN = re.compile(
-    r'@FG:(CLAIM|RELEASE|FACT|TRIPWIRE|TRIGGER|STEER|HOLD|GO|VETO)\s+([^\s\r\n]+)(?:[ \t]+([^\r\n]+))?',
+    r'@FG:(CLAIM|RELEASE|FACT|TRIPWIRE|TRIGGER|STEER|HOLD|GO|VETO|DISPUTE|HANDOFF)\s+([^\s\r\n]+)(?:[ \t]+([^\r\n]+))?',
     re.IGNORECASE,
 )
 
@@ -401,6 +401,35 @@ def capture_process(command,root,timeout=60,env=None,cancelled=None):
     return proc.returncode,text
 
 
+def controller_arbitration_prompt(dispute, project_name, contracts_markdown, blackboard_digest, tasks_summary, code_excerpts=""):
+    """Build the explicit instruction prompt for the Main Controller Agent when arbitrating a swarm dispute."""
+    return (
+        f"You are the MAIN CONTROLLER & LEAD ARCHITECT AI for project '{project_name}'.\n"
+        f"Your role is high-level swarm arbitration, contract enforcement, and task routing (NO direct file editing in this turn).\n\n"
+        f"=== ACTIVE SWARM DISPUTE / ESCALATION ===\n"
+        f"- Raised By Agent: {dispute.get('sender_agent_id', 'worker')}\n"
+        f"- Target File / Module / Task: {dispute.get('target', '')}\n"
+        f"- Problem Description: {dispute.get('reason', '')}\n\n"
+        f"=== AGREED INTERFACE CONTRACTS (Excerpt) ===\n"
+        f"{(contracts_markdown or '')[:2000]}\n\n"
+        f"=== ACTIVE TASKS & ASSIGNMENTS ===\n"
+        f"{tasks_summary}\n\n"
+        f"{blackboard_digest}\n"
+        f"{('=== RELEVANT WORKSPACE CODE EXCERPTS ===' + chr(10) + code_excerpts) if code_excerpts else ''}\n\n"
+        f"=== YOUR CONTROLLER DUTIES ===\n"
+        f"1. Diagnose the root cause of the conflict (e.g., signature mismatch against CONTRACTS.md, file lock contention, or missing export).\n"
+        f"2. Provide a concise, binding architectural ruling.\n"
+        f"3. Emit 1-line C2 coordination signals (one per line) to enforce your ruling across the worker swarm:\n"
+        f"   - `@FG:STEER <agent_id_or_task_id> <directive>` (streams live into the worker's `.funguys_inbox.md`)\n"
+        f"   - `@FG:STEER <task_id> ROLE=important_coding <directive>` (re-classifies task tier if needed)\n"
+        f"   - `@FG:FACT <key> <value>` (records binding architectural decision on the shared Blackboard)\n"
+        f"   - `@FG:HOLD <task_id> <reason>` or `@FG:GO <task_id>` (pauses or unblocks dependent tasks)\n"
+        f"   - `@FG:VETO <task_id> <reason>` (cancels a broken implementation and forces rework)\n"
+        f"   - `@FG:HANDOFF <agent_id> <target_agent_id> <reason>` (resets an agent's context window and hands off its WIP)\n"
+        f"Do not call file-editing tools in this response."
+    )
+
+
 def task_prompt(assignment):
     task = assignment['task']
     contract_slice = slice_contract_for_task(
@@ -417,6 +446,7 @@ def task_prompt(assignment):
         steer_block = f"\nController Steering Directives (HIGHEST PRIORITY):\n{joined_prompts}\n"
     return (
         f"Implement {task['id']}: {task['title']}\n{task['description']}\n"
+        f"Role: Authenticated FunGuys Worker Agent\n"
         f"Target files: {', '.join(task['target_files'])}\n"
         f"{steer_block}"
         f"Contracts:\n{contract_slice}\n{assignment.get('subgraph_digest','')}\n"
@@ -424,8 +454,14 @@ def task_prompt(assignment):
         f"Handoff / interface updates:\n{task.get('handoff_digest') or ''}\n"
         f"QA failure to fix:\n{compact_err}\n"
         "If a live steering note appears in `.funguys_inbox.md`, follow it immediately.\n"
+        "Problem Detection & Dispute Escalation Rules:\n"
+        "- If you detect a contradiction between existing code and CONTRACTS.md, a `[LOCK]`/`[TRIPWIRE]` collision on the Blackboard, "
+        "or a test/import error caused by a file outside your assigned `target_files`, DO NOT modify unassigned files or invent hacks.\n"
+        "- Immediately emit `@FG:DISPUTE <file_or_task_id> <explanation>` in stdout so the Main Controller arbitrates.\n"
+        "- If your context window is saturated or you need to pass WIP to another worker, emit `@FG:HANDOFF <target_agent_id_or_self> <handoff_notes>`.\n"
         "Optional 1-line C2 signals you may print in stdout: "
-        "`@FG:FACT <key> <value>`, `@FG:CLAIM <file>`, `@FG:TRIPWIRE <file> <reason>`, "
+        "`@FG:FACT <key> <value>`, `@FG:CLAIM <file>`, `@FG:RELEASE <file>`, `@FG:TRIPWIRE <file> <reason>`, "
+        "`@FG:DISPUTE <target> <reason>`, `@FG:HANDOFF <target> <notes>`, "
         "`@FG:TRIGGER <task_id> <agent_id>`, `@FG:STEER <agent_id> <msg>`.\n"
         "Read existing source before editing. Make focused changes. Do not read credentials or files outside this workspace. Do not claim success without implementing the task."
     )
@@ -553,7 +589,7 @@ class WorkerRuntime:
                                 f.write(f"\n### Live Interface / Guidance Update\n{new_digest}\n")
                         except Exception:
                             pass
-                if any(p.get('mode') == 'interrupt' for p in prompts):
+                if any(p.get('mode') in ('interrupt', 'handoff') for p in prompts):
                     self.cancelled.set()
                 if current and not result['active']:
                     self.cancelled.set()
@@ -615,12 +651,9 @@ class WorkerRuntime:
                 if self.cancelled.is_set():
                     if any(changes.values()):
                         try:
-                            self.request('POST', f'/api/agents/{self.agent_id}/quota', {
-                                'used_pct': float(agent_info.get('used_pct', 0)),
-                                'turns_delta': 1,
-                                'rate_limited': False,
+                            self.request('POST', f'/api/agents/{self.agent_id}/handoff', {
                                 'assignment_id': task['assignment_id'],
-                                'handoff_notes': 'Interrupted by Controller steering; WIP checkpointed.',
+                                'handoff_notes': 'Interrupted for Controller promotion, arbitration, or live steering; WIP checkpointed.',
                                 'wip_files': changes['files'],
                                 'wip_binary_files': changes['binary_files'],
                                 'deleted_files': changes['deleted_files'],
@@ -643,12 +676,9 @@ class WorkerRuntime:
                     try:
                         changes = collect_changes(root, snapshot)
                         if any(changes.values()):
-                            self.request('POST', f'/api/agents/{self.agent_id}/quota', {
-                                'used_pct': float(agent_info.get('used_pct', 0)),
-                                'turns_delta': 1,
-                                'rate_limited': False,
+                            self.request('POST', f'/api/agents/{self.agent_id}/handoff', {
                                 'assignment_id': task['assignment_id'],
-                                'handoff_notes': 'Cancelled for live steering; WIP saved.',
+                                'handoff_notes': 'Cancelled for Controller promotion, arbitration, or live steering; WIP saved.',
                                 'wip_files': changes['files'],
                                 'wip_binary_files': changes['binary_files'],
                                 'deleted_files': changes['deleted_files'],

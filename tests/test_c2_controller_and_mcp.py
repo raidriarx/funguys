@@ -247,6 +247,8 @@ def test_mcp_worker_server_initialization_and_tools():
     assert "fg_listen" in tool_names
     assert "fg_check_inbox" in tool_names
     assert "fg_signal" in tool_names
+    assert "fg_dispute" in tool_names
+    assert "fg_handoff" in tool_names
     assert "fg_steer" in tool_names
     assert "fg_submit" in tool_names
 
@@ -271,3 +273,195 @@ def test_keep_awake_and_git_c2_sync(tmp_path):
     assert loaded is not None
     assert loaded["project"]["name"] == "C2 Project"
     assert loaded["beacon"]["lan_ip"] == "192.168.1.50"
+
+
+def test_feature_9_controller_drops_task_on_promotion_and_arbitration(tmp_path):
+    app = create_host_app(tmp_path, admin_token="test-admin-f9")
+    client = TestClient(app, headers={"Authorization": "Bearer test-admin-f9"})
+    try:
+        # Register Agent A (Claude Tier 1) and Agent B (Claude Tier 1)
+        agent_a = client.post(
+            "/api/agents/register",
+            json={
+                "owner_name": "Alex",
+                "machine_name": "mac-claude-1",
+                "profile_key": "claude-opus",
+                "worker_id": "worker-f9-claude-1",
+                "executor": "remote",
+            },
+        ).json()
+        agent_b = client.post(
+            "/api/agents/register",
+            json={
+                "owner_name": "Blair",
+                "machine_name": "mac-claude-2",
+                "profile_key": "claude-opus",
+                "worker_id": "worker-f9-claude-2",
+                "executor": "remote",
+            },
+        ).json()
+
+        # Approve plan so task-1-contracts is assigned to one of the Tier-1 agents
+        state0 = client.get("/api/state").json()
+        approved = client.post("/api/project/approve", json={"plan_version": state0["project"]["plan_version"]}).json()
+        t1 = next(t for t in approved["tasks"] if t["id"] == "task-1-contracts")
+        assert t1["status"] == "in_progress"
+        initial_owner = t1["assigned_agent_id"]
+        other_agent = agent_b["id"] if initial_owner == agent_a["id"] else agent_a["id"]
+
+        # Promote the currently working agent (`initial_owner`) to Main Controller
+        promo = client.post(f"/api/agents/{initial_owner}/controller")
+        assert promo.status_code == 200
+        promo_agent = promo.json()
+        # Feature #9: Promoting a working agent drops its coding task, leaves it IDLE as Controller,
+        # and hands the task off to the other idle Tier-1 worker (`other_agent`)!
+        assert promo_agent["is_controller"] is True
+        assert promo_agent["status"] == "idle"
+        assert promo_agent["current_task_id"] is None
+
+        after_state = client.get("/api/state").json()
+        t1_after = next(t for t in after_state["tasks"] if t["id"] == "task-1-contracts")
+        assert t1_after["status"] == "in_progress"
+        assert t1_after["assigned_agent_id"] == other_agent
+        assert "Promoted to Main Controller Agent" in (t1_after.get("handoff_digest") or "")
+    finally:
+        app.state.host_lock.release()
+
+
+def test_feature_9_controller_resumes_own_task_when_all_workers_busy(tmp_path, monkeypatch):
+    from funguys.worker import adapters
+    monkeypatch.setattr(
+        adapters,
+        "run_text_agent",
+        lambda provider, prompt, *a, **kw: (
+            "Binding Ruling: Backend must return JSON.\n"
+            "@FG:FACT api_format json\n"
+            "@FG:STEER task-1-contracts Ensure return payload is JSON dict\n"
+        ),
+    )
+    app = create_host_app(tmp_path, admin_token="test-admin-f9-resume")
+    client = TestClient(app, headers={"Authorization": "Bearer test-admin-f9-resume"})
+    try:
+        # Register only 1 Tier-1 Controller (Claude) and 1 Tier-2 Worker (Gemini, marked high quota / busy)
+        ctrl = client.post(
+            "/api/agents/register",
+            json={
+                "owner_name": "LeadClaude",
+                "machine_name": "mac-controller",
+                "profile_key": "claude-opus",
+                "worker_id": "worker-ctrl-only-1",
+                "executor": "remote",
+            },
+        ).json()
+        worker2 = client.post(
+            "/api/agents/register",
+            json={
+                "owner_name": "BusyGemini",
+                "machine_name": "laptop-gemini",
+                "profile_key": "gemini-argon-flash",
+                "initial_used_pct": 95.0,  # In cooldown / busy so no other worker is idle
+                "worker_id": "worker-busy-gemini-2",
+                "executor": "remote",
+            },
+        ).json()
+
+        state0 = client.get("/api/state").json()
+        approved = client.post("/api/project/approve", json={"plan_version": state0["project"]["plan_version"]}).json()
+        t1 = next(t for t in approved["tasks"] if t["id"] == "task-1-contracts")
+        assert t1["assigned_agent_id"] == ctrl["id"]
+        assert t1["status"] == "in_progress"
+
+        # Worker 2 raises a @FG:DISPUTE while the Controller is coding task-1-contracts and all other workers are busy
+        arb_resp = client.post(
+            "/api/controller/arbitrate",
+            json={
+                "sender_agent_id": worker2["id"],
+                "target": "backend/service.py",
+                "reason": "Contract requires JSON dict return type, found tuple",
+                "task_id": "task-1-contracts",
+            },
+        )
+        assert arb_resp.status_code == 200, arb_resp.text
+        arb_data = arb_resp.json()
+        assert arb_data["controller_agent_id"] == ctrl["id"]
+        assert arb_data["dropped_task_id"] == "task-1-contracts"
+        assert "Binding Ruling" in arb_data["ruling"]
+
+        # Verify Blackboard recorded both the dispute tripwire and the Controller's @FG:FACT ruling
+        bb = {b["key"]: b for b in client.get("/api/blackboard").json()["blackboard"]}
+        assert "dispute:backend/service.py" in bb
+        assert bb.get("api_format", {}).get("value") == "json"
+
+        # Verify Controller automatically resumed coding its own task-1-contracts afterwards since all other workers were busy!
+        final_state = client.get("/api/state").json()
+        t1_final = next(t for t in final_state["tasks"] if t["id"] == "task-1-contracts")
+        assert t1_final["status"] == "in_progress"
+        assert t1_final["assigned_agent_id"] == ctrl["id"]
+        assert "Paused coding on task-1-contracts to arbitrate swarm dispute" in (t1_final.get("handoff_digest") or "")
+    finally:
+        app.state.host_lock.release()
+
+
+def test_feature_4_on_demand_context_window_reset_and_targeted_handoff(tmp_path):
+    app = create_host_app(tmp_path, admin_token="test-admin-f4")
+    client = TestClient(app, headers={"Authorization": "Bearer test-admin-f4"})
+    try:
+        agent_a = client.post(
+            "/api/agents/register",
+            json={
+                "owner_name": "CoderA",
+                "machine_name": "node-a",
+                "profile_key": "claude-opus",
+                "worker_id": "worker-f4-node-a",
+                "executor": "remote",
+            },
+        ).json()
+        agent_b = client.post(
+            "/api/agents/register",
+            json={
+                "owner_name": "CoderB",
+                "machine_name": "node-b",
+                "profile_key": "claude-opus",
+                "worker_id": "worker-f4-node-b",
+                "executor": "remote",
+            },
+        ).json()
+
+        state0 = client.get("/api/state").json()
+        approved = client.post("/api/project/approve", json={"plan_version": state0["project"]["plan_version"]}).json()
+        t1 = next(t for t in approved["tasks"] if t["id"] == "task-1-contracts")
+        first_id = t1["assigned_agent_id"]
+        second_id = agent_b["id"] if first_id == agent_a["id"] else agent_a["id"]
+
+        # Trigger on-demand context window reset & targeted handoff from first_id -> second_id with WIP files
+        ho_resp = client.post(
+            f"/api/agents/{first_id}/handoff",
+            json={
+                "target_agent_id": second_id,
+                "handoff_notes": "Context window reset at 60k tokens; partial service stub committed.",
+                "assignment_id": t1["assignment_id"],
+                "wip_files": {"backend/service.py": "# WIP checkpoint from first agent\ndef create_item(title, priority=1):\n    return {'title': title}\n"},
+                "reset_window": True,
+            },
+        )
+        assert ho_resp.status_code == 200, ho_resp.text
+        ho_data = ho_resp.json()
+        assert ho_data["handoff"] == "task-1-contracts"
+        # First agent must be IDLE (NOT locked in COOLDOWN) with fresh window
+        assert ho_data["agent"]["status"] == "idle"
+        assert ho_data["agent"]["used_pct"] == 0.0
+
+        # Second agent must now own task-1-contracts with the Baton Pass handoff digest and WIP snapshot
+        state1 = client.get("/api/state").json()
+        t1_new = next(t for t in state1["tasks"] if t["id"] == "task-1-contracts")
+        assert t1_new["status"] == "in_progress"
+        assert t1_new["assigned_agent_id"] == second_id
+        assert "partial service stub committed" in (t1_new.get("handoff_digest") or "")
+
+        snap = client.get(
+            "/api/workspace/snapshot",
+            params={"task_id": "task-1-contracts", "assignment_id": t1_new["assignment_id"]},
+        ).json()
+        assert "WIP checkpoint from first agent" in snap["files"].get("backend/service.py", "")
+    finally:
+        app.state.host_lock.release()

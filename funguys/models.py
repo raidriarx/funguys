@@ -41,6 +41,8 @@ class SignalOp(str, Enum):
     HOLD = "HOLD"
     GO = "GO"
     VETO = "VETO"
+    DISPUTE = "DISPUTE"
+    HANDOFF = "HANDOFF"
 
 
 class AgentSignal(BaseModel):
@@ -56,7 +58,7 @@ class PromptQueueItem(BaseModel):
     id: str = Field(default_factory=lambda: f"pq-{uuid.uuid4().hex[:8]}")
     target_agent_id: str
     sender_agent_id: str
-    mode: Literal["queue", "steer", "interrupt"] = "queue"
+    mode: Literal["queue", "steer", "interrupt", "handoff"] = "queue"
     prompt: str = Field(min_length=1, max_length=4000)
     priority: int = Field(default=10, ge=0, le=100)
     delivered: bool = False
@@ -253,3 +255,20 @@ class ReportQuotaRequest(BaseModel):
     handoff_notes: Optional[str] = None
     reset_window: bool = False
     assignment_id: Optional[str] = None
+
+
+class HandoffAgentRequest(BaseModel):
+    target_agent_id: Optional[str] = None
+    handoff_notes: str = Field(default="Context window reset & baton pass handoff.", max_length=4000)
+    assignment_id: Optional[str] = None
+    wip_files: Dict[str, str] = Field(default_factory=dict)
+    wip_binary_files: Dict[str, str] = Field(default_factory=dict)
+    deleted_files: List[str] = Field(default_factory=list)
+    reset_window: bool = False
+
+
+class ArbitrateDisputeRequest(BaseModel):
+    sender_agent_id: str = "worker"
+    target: str = Field(min_length=1, max_length=256)
+    reason: str = Field(min_length=1, max_length=4000)
+    task_id: Optional[str] = None

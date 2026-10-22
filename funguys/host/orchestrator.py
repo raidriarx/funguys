@@ -223,11 +223,84 @@ class FunGuysOrchestrator:
             self.store.save_project(project)
         return best
 
+    async def drop_task_for_controller(
+        self,
+        agent_id: str,
+        reason: str = 'Called upon to act as Main Controller; dropping active coding task with WIP handoff.',
+        schedule_immediately: bool = True,
+        allow_self_reclaim: bool = False,
+    ) -> Optional[str]:
+        """Feature #9: Cleanly drop and checkpoint any active coding task when an agent becomes or acts as Main Controller."""
+        dropped_task_id = None
+        async with self._state_lock:
+            agent = self.store.get_agent(agent_id)
+            if not agent or not agent.current_task_id:
+                return None
+            task = self.store.get_task(agent.current_task_id)
+            if task and task.status == TaskStatus.IN_PROGRESS:
+                if task.candidate_path and Path(task.candidate_path).exists():
+                    try:
+                        task.candidate_revision = await asyncio.to_thread(self.git.checkpoint, task, {}, [])
+                    except Exception:
+                        pass
+                self._cancel_assignment(task)
+                if agent.executor in ('remote', 'mcp', 'mcp_ide'):
+                    self.store.enqueue_prompt(PromptQueueItem(
+                        target_agent_id=agent.id,
+                        sender_agent_id='controller',
+                        mode='handoff',
+                        prompt=reason,
+                        priority=95,
+                    ))
+                digest = self.git.create_handoff_document(
+                    task.id,
+                    agent.id,
+                    reason,
+                    self.graph.get_subgraph_digest(task.target_files),
+                )
+                task.handoff_digest = ((task.handoff_digest + '\n\n' + digest) if task.handoff_digest else digest).strip()
+                other_idle = [
+                    a for a in self.store.list_agents()
+                    if a.id != agent.id
+                    and a.status == AgentStatus.IDLE
+                    and a.current_task_id is None
+                    and a.used_pct < a.soft_limit_pct
+                ]
+                if not other_idle and allow_self_reclaim:
+                    task.preferred_agent_id = agent.id
+                task.status = TaskStatus.HANDOFF_PENDING
+                task.assigned_agent_id = None
+                task.assignment_id = None
+                self.store.save_task(task)
+                dropped_task_id = task.id
+            agent.current_task_id = None
+            if agent.status == AgentStatus.WORKING:
+                agent.status = AgentStatus.IDLE
+            self.store.save_agent(agent)
+        if dropped_task_id:
+            await self.emit_event(
+                agent_id,
+                'controller_task_dropped',
+                f'Controller {agent.display_name} dropped {dropped_task_id} (WIP saved) to assume Controller duties.',
+                {'task_id': dropped_task_id, 'agent_id': agent_id},
+            )
+            if schedule_immediately:
+                if not allow_self_reclaim:
+                    self._consulting_agents.add(agent_id)
+                try:
+                    await self.schedule_ready_tasks()
+                finally:
+                    if not allow_self_reclaim:
+                        self._consulting_agents.discard(agent_id)
+        return dropped_task_id
+
     async def designate_controller(self, agent_id: str) -> AgentNode:
+        has_active_task = False
         async with self._state_lock:
             target = self.store.get_agent(agent_id)
             if not target:
                 raise ValueError('Unknown agent')
+            has_active_task = bool(target.current_task_id)
             for a in self.store.list_agents():
                 a.is_controller = (a.id == agent_id)
                 self.store.save_agent(a)
@@ -235,6 +308,13 @@ class FunGuysOrchestrator:
             if project:
                 project.lead_architect_agent_id = agent_id
                 self.store.save_project(project)
+        if has_active_task:
+            await self.drop_task_for_controller(
+                agent_id,
+                reason='Promoted to Main Controller Agent; WIP checkpointed for handoff.',
+                schedule_immediately=True,
+                allow_self_reclaim=False,
+            )
         await self.emit_event('controller', 'controller_elected', f'{target.display_name} designated as Main Controller Agent.', {'agent_id': agent_id})
         return self.store.get_agent(agent_id)
 
@@ -385,9 +465,11 @@ class FunGuysOrchestrator:
         return "Shared Blackboard Facts & Locks:\n" + "\n".join(lines)
 
     async def process_signals(self, sender_agent_id: str, raw_signals: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Process 1-line C2 coordination signals (`@FG:CLAIM`, `FACT`, `TRIPWIRE`, `TRIGGER`, `STEER`, `HOLD`, `GO`, `VETO`)."""
+        """Process 1-line C2 coordination signals (`@FG:CLAIM`, `FACT`, `TRIPWIRE`, `TRIGGER`, `STEER`, `HOLD`, `GO`, `VETO`, `DISPUTE`, `HANDOFF`)."""
         processed = []
         trigger_schedule = False
+        disputes_to_arbitrate = []
+        handoffs_to_execute = []
         async with self._state_lock:
             sender = self.store.get_agent(sender_agent_id)
             is_ctrl = bool(sender and sender.is_controller) or sender_agent_id in ('controller', 'human-team')
@@ -485,9 +567,38 @@ class FunGuysOrchestrator:
                         self.store.save_task(task)
                         trigger_schedule = True
                         processed.append({'op': op, 'target': target})
+                elif op == SignalOp.DISPUTE.value:
+                    disputes_to_arbitrate.append((sender_agent_id, target, payload or 'Dispute raised by worker'))
+                    processed.append({'op': op, 'target': target, 'payload': payload})
+                elif op == SignalOp.HANDOFF.value:
+                    parts = payload.split(None, 1) if payload else []
+                    first_token = parts[0] if parts else ''
+                    if target.lower() == 'self':
+                        agent_to_handoff = sender_agent_id
+                        succ_id = first_token if (first_token and self.store.get_agent(first_token)) else None
+                        notes = (parts[1] if (succ_id and len(parts) > 1) else payload) or 'Self context reset & handoff'
+                    elif is_ctrl and self.store.get_agent(target):
+                        agent_to_handoff = target
+                        succ_id = first_token if (first_token and self.store.get_agent(first_token)) else None
+                        notes = (parts[1] if (succ_id and len(parts) > 1) else payload) or 'Controller-directed context reset & handoff'
+                    elif sender and sender.current_task_id and self.store.get_agent(target):
+                        agent_to_handoff = sender_agent_id
+                        succ_id = target
+                        notes = payload or f'Worker baton pass to {target}'
+                    else:
+                        agent_to_handoff = target if self.store.get_agent(target) else sender_agent_id
+                        succ_id = None
+                        notes = payload or 'Context reset & handoff'
+                    if agent_to_handoff and self.store.get_agent(agent_to_handoff):
+                        handoffs_to_execute.append((agent_to_handoff, succ_id, notes))
+                        processed.append({'op': op, 'target': agent_to_handoff, 'target_agent_id': succ_id or ''})
         if processed:
             await self.emit_event(sender_agent_id, 'c2_signals_processed', f"Processed {len(processed)} C2 signal(s): {', '.join(p['op'] + ':' + p['target'] for p in processed)}", {'signals': processed})
-        if trigger_schedule:
+        for agent_to_handoff, succ_id, notes in handoffs_to_execute:
+            await self.handoff_agent_task(agent_to_handoff, target_agent_id=succ_id, handoff_notes=notes)
+        for disp_sender, disp_target, disp_reason in disputes_to_arbitrate:
+            await self.arbitrate_dispute(disp_sender, disp_target, disp_reason)
+        if trigger_schedule and not handoffs_to_execute and not disputes_to_arbitrate:
             await self.schedule_ready_tasks()
         return processed
 
@@ -500,7 +611,7 @@ class FunGuysOrchestrator:
         sender_agent_id: str = "controller",
     ) -> Dict[str, object]:
         """Allow the Main Controller or Human to queue a prompt, live-steer, or immediately trigger an agent."""
-        clean_mode = mode if mode in ("queue", "steer", "interrupt") else "steer"
+        clean_mode = mode if mode in ("queue", "steer", "interrupt", "handoff") else "steer"
         async with self._state_lock:
             agent = self.store.get_agent(target_agent_id)
             if not agent:
@@ -510,7 +621,7 @@ class FunGuysOrchestrator:
                 sender_agent_id=sender_agent_id,
                 mode=clean_mode,
                 prompt=prompt.strip(),
-                priority=80 if clean_mode == "interrupt" else 40,
+                priority=80 if clean_mode in ("interrupt", "handoff") else 40,
             )
             self.store.enqueue_prompt(item)
             active_tid = task_id or agent.current_task_id
@@ -524,12 +635,228 @@ class FunGuysOrchestrator:
                         task.held = False
                         task.held_by_controller = False
                         task.hold_reason = None
-                    if clean_mode == "interrupt" and task.status == TaskStatus.IN_PROGRESS:
+                    if clean_mode in ("interrupt", "handoff") and task.status == TaskStatus.IN_PROGRESS:
                         self._cancel_assignment(task)
                     self.store.save_task(task)
         await self.emit_event(sender_agent_id, "agent_steered", f"Queued [{clean_mode.upper()}] directive for {agent.display_name}", {"target_agent_id": target_agent_id, "mode": clean_mode})
         assignments = await self.schedule_ready_tasks()
         return {"queued": item.model_dump(), "assignments": assignments}
+
+    async def handoff_agent_task(
+        self,
+        agent_id: str,
+        target_agent_id: Optional[str] = None,
+        handoff_notes: str = "Context window reset & baton pass handoff.",
+        assignment_id: Optional[str] = None,
+        wip_files: Optional[Dict[str, str]] = None,
+        wip_binary_files: Optional[Dict[str, str]] = None,
+        deleted_files: Optional[List[str]] = None,
+        reset_window: bool = False,
+        preserve_self_if_busy: bool = False,
+    ) -> Dict[str, object]:
+        """Feature #4: Reset an agent's active task context window, checkpoint WIP to Git, and hand off to a target (or idle) agent without cooldown."""
+        handoff_task_id = None
+        async with self._state_lock:
+            agent = self.store.get_agent(agent_id)
+            if not agent:
+                raise ValueError("Unknown worker")
+            if target_agent_id and target_agent_id != "auto" and not self.store.get_agent(target_agent_id):
+                raise ValueError("Target handoff agent not found")
+            if reset_window:
+                agent.turns_used = 0
+                agent.high_tier_turns_used = 0
+                agent.used_pct = 0.0
+                agent.high_tier_used_pct = 0.0
+                agent.quota_window_started_at = utc_now_iso()
+                agent.high_tier_window_started_at = utc_now_iso()
+            agent.last_heartbeat = utc_now_iso()
+            task = self.store.get_task(agent.current_task_id) if agent.current_task_id else None
+            if task and task.status == TaskStatus.IN_PROGRESS:
+                if assignment_id and assignment_id != task.assignment_id:
+                    raise ConflictError("Handoff references a stale assignment")
+                if wip_files or wip_binary_files or deleted_files:
+                    task.candidate_revision = await asyncio.to_thread(
+                        self.git.checkpoint,
+                        task,
+                        decode_files(wip_files or {}, wip_binary_files),
+                        deleted_files or [],
+                    )
+                elif task.candidate_path and Path(task.candidate_path).exists():
+                    try:
+                        task.candidate_revision = await asyncio.to_thread(self.git.checkpoint, task, {}, [])
+                    except Exception:
+                        pass
+                self._cancel_assignment(task)
+                if agent.executor in ("remote", "mcp", "mcp_ide"):
+                    self.store.enqueue_prompt(PromptQueueItem(
+                        target_agent_id=agent.id,
+                        sender_agent_id="controller",
+                        mode="handoff",
+                        prompt=f"Context reset / handoff triggered: {handoff_notes}",
+                        priority=90,
+                    ))
+                digest = self.git.create_handoff_document(
+                    task.id,
+                    agent.id,
+                    handoff_notes or "Context window reset; resume from checkpoint.",
+                    self.graph.get_subgraph_digest(task.target_files),
+                )
+                task.handoff_digest = ((task.handoff_digest + "\n\n" + digest) if task.handoff_digest else digest).strip()
+                if target_agent_id and target_agent_id != "auto":
+                    task.preferred_agent_id = target_agent_id
+                elif preserve_self_if_busy:
+                    other_idle = [
+                        a for a in self.store.list_agents()
+                        if a.id != agent.id
+                        and a.status == AgentStatus.IDLE
+                        and a.current_task_id is None
+                        and a.used_pct < a.soft_limit_pct
+                    ]
+                    if not other_idle:
+                        task.preferred_agent_id = agent.id
+                task.status = TaskStatus.HANDOFF_PENDING
+                task.assigned_agent_id = None
+                task.assignment_id = None
+                self.store.save_task(task)
+                handoff_task_id = task.id
+            agent.current_task_id = None
+            if agent.status == AgentStatus.WORKING:
+                agent.status = AgentStatus.IDLE
+            self.store.save_agent(agent)
+        if handoff_task_id:
+            await self.emit_event(
+                agent_id,
+                "context_reset_handoff",
+                f"Context window reset & baton pass for {handoff_task_id} (target={target_agent_id or 'auto'})",
+                {"task_id": handoff_task_id, "from_agent_id": agent_id, "target_agent_id": target_agent_id},
+            )
+        # If handing off to another agent (or auto when other agents exist), avoid immediately re-assigning to the same agent unless requested
+        exclude_self = bool(
+            handoff_task_id
+            and target_agent_id != agent_id
+            and not preserve_self_if_busy
+            and any(
+                a.id != agent_id and a.status == AgentStatus.IDLE and a.current_task_id is None and a.used_pct < a.soft_limit_pct
+                for a in self.store.list_agents()
+            )
+        )
+        if exclude_self:
+            self._consulting_agents.add(agent_id)
+        try:
+            assignments = await self.schedule_ready_tasks()
+        finally:
+            if exclude_self:
+                self._consulting_agents.discard(agent_id)
+        return {
+            "agent": self.public_agent(self.store.get_agent(agent_id)),
+            "handoff": handoff_task_id,
+            "new_assignments": assignments,
+        }
+
+    async def arbitrate_dispute(
+        self,
+        sender_agent_id: str,
+        target: str,
+        reason: str,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """Feature #2 & #9: Free the Main Controller (dropping its coding task if busy), run an arbitration turn, and steer workers."""
+        from funguys.worker.adapters import run_text_agent
+        from funguys.protocol import controller_arbitration_prompt
+
+        async with self._state_lock:
+            ctrl = self._ensure_controller_elected()
+            if not ctrl:
+                raise ConflictError("No controller agent available to arbitrate dispute")
+            ctrl_id = ctrl.id
+            was_coding_task_id = ctrl.current_task_id
+
+        # Feature #9: If the Controller is currently coding a task, drop & checkpoint it before arbitrating
+        dropped_task_id = None
+        if was_coding_task_id:
+            dropped_task_id = await self.drop_task_for_controller(
+                ctrl_id,
+                reason=f"Paused coding on {was_coding_task_id} to arbitrate swarm dispute on {target}: {reason}",
+                schedule_immediately=False,
+                allow_self_reclaim=True,
+            )
+
+        self.store.put_blackboard(BlackboardEntry(
+            key=f"dispute:{target}",
+            kind="tripwire",
+            value=f"[{sender_agent_id}] {reason}"[:1000],
+            agent_id=sender_agent_id,
+            task_id=task_id,
+        ))
+
+        async with self._state_lock:
+            ctrl = self.store.get_agent(ctrl_id)
+            self._consulting_agents.add(ctrl_id)
+            project = self.store.get_project()
+            tasks = self.store.list_tasks()
+            tasks_summary = "\n".join(
+                f"- {t.id} [{t.status.value}] (assigned={t.assigned_agent_id or 'none'}, files={','.join(t.target_files)}): {t.title}"
+                for t in tasks
+            )
+            bb_digest = self._blackboard_digest_for_task(tasks[0]) if tasks else ""
+
+        ruling_text = ""
+        emitted_signals = []
+        try:
+            files = await asyncio.to_thread(bundle, self.git.workspace_path)
+            excerpts = []
+            for fname, content in files.get("files", {}).items():
+                if target in fname or fname in target:
+                    excerpts.append(f"FILE {fname}:\n{content[:1000]}")
+            prompt = controller_arbitration_prompt(
+                {"sender_agent_id": sender_agent_id, "target": target, "reason": reason},
+                project.name,
+                project.contracts_markdown,
+                bb_digest,
+                tasks_summary,
+                "\n\n".join(excerpts[:3]),
+            )
+            try:
+                ruling_text = await asyncio.to_thread(run_text_agent, ctrl.provider, prompt, role="planning")
+            except Exception as exc:
+                ruling_text = f"Controller arbitration recorded dispute on {target} ({exc}). @FG:STEER {sender_agent_id} Follow CONTRACTS.md strictly for {target}"
+            parsed = [s for s in parse_agent_signals(ctrl_id, ruling_text) if s.op != SignalOp.DISPUTE]
+            if parsed:
+                emitted_signals = await self.process_signals(
+                    ctrl_id,
+                    [{"op": s.op.value, "target": s.target, "payload": s.payload} for s in parsed],
+                )
+            if sender_agent_id and self.store.get_agent(sender_agent_id):
+                self.store.enqueue_prompt(PromptQueueItem(
+                    target_agent_id=sender_agent_id,
+                    sender_agent_id=ctrl_id,
+                    mode="steer",
+                    prompt=f"[Controller Arbitration Ruling on {target}]: {ruling_text[:600]}",
+                    priority=85,
+                ))
+        finally:
+            async with self._state_lock:
+                self._consulting_agents.discard(ctrl_id)
+                ctrl_after = self.store.get_agent(ctrl_id)
+                if ctrl_after and not ctrl_after.current_task_id:
+                    ctrl_after.status = AgentStatus.COOLDOWN if ctrl_after.cooldown_until else AgentStatus.IDLE
+                    self.store.save_agent(ctrl_after)
+
+        await self.emit_event(
+            ctrl_id,
+            "dispute_arbitrated",
+            f"Controller arbitrated dispute from {sender_agent_id} on {target}.",
+            {"sender_agent_id": sender_agent_id, "target": target, "dropped_task_id": dropped_task_id, "signals": emitted_signals},
+        )
+        # Re-schedule ready/handoff tasks: if all other workers were busy, Controller now re-claims its own dropped task!
+        next_assignments = await self.schedule_ready_tasks()
+        return {
+            "controller_agent_id": ctrl_id,
+            "dropped_task_id": dropped_task_id,
+            "ruling": ruling_text,
+            "signals_processed": emitted_signals,
+            "next_assignments": next_assignments,
+        }
 
     async def schedule_ready_tasks(self):
         assignments = []

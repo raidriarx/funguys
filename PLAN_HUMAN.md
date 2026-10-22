@@ -1,111 +1,103 @@
-# Gaper Bingzoid (FunGuys) — Multi-Agent C2 & Coordination Plan (Human Guide)
+# Gaper Bingzoid (FunGuys) — Model A ("Player-Coach") Controller, Dispute Arbitration & Dynamic Handoff Plan (`PLAN_HUMAN.md`)
 
-## 1. Executive Summary & Goal
+## 1. Executive Summary & Architecture Goal
 
-The goal of this upgrade is to transform **FunGuys** from a static batch-task runner into a **token-efficient, multi-agent command-and-control (C2) coordination network** where:
-1. **AI agents can communicate, trigger each other, and queue/steer prompts** to any other agent mid-flight.
-2. **All coordination routes through One Main Controller Agent** (hub-and-spoke architecture) so agents never get stuck in chaotic N×N chat loops.
-3. **Controller-Driven Work Classification (Important Work vs. Gruntwork/Testing)**:
-   - **Planning Priority Order**: Always defaults to **1st: Claude (`opus:high`) $\to$ 2nd: Google (`argon:medium`) $\to$ 3rd: ChatGPT (`astra:low`)**, matching the exact order of how much usage rate each model has.
-   - **Main Controller Decides "Important Work" vs. "Gruntwork"**: Rather than blindly downgrading a task just because it is large or token-heavy, the **Main Controller Agent** explicitly classifies each task (and can dynamically re-classify via `@FG:STEER`) into:
-     - **Important Work (`important_coding`, Tier 1)**: Core algorithms, critical architecture, security, and complex logic—even if large—are routed to **`argon:low`** (Google), **`opus:high`** (Claude), or **`sol:high`** (ChatGPT).
-     - **Gruntwork & Testing (`gruntwork` / `testing`, Tier 2)**: Boilerplate, repetitive wiring, UI scaffolding, and all test suites are offloaded to **`flash:high`** (Google), **`opus:medium`** (Claude), and **`sol:high`** (ChatGPT) so Argon is never wasted on gruntwork.
-4. **Coordination uses the July 2026 ExploitGym / Hugging Face Swarm primitives**—stripped of cryptographic signatures (`Ed25519`) and folder-name encoding—leaving pure, telegraphic synchronization signals (`CLAIM`, `RELEASE`, `FACT`, `TRIPWIRE`, `TRIGGER`, `STEER`, `HOLD`, `GO`, `VETO`) and a **Shared Blackboard**.
-5. **Cross-Platform & Serverless Laptop Operation**: Works natively on **macOS, Windows, and Linux**, supports **Claude (`claude`), ChatGPT (`codex`), Google (`gemini`/`agy`), and IDE/Desktop AI apps** (Cursor, Windsurf, Antigravity, Claude Desktop, ChatGPT App), and runs **100% free on laptops using GitHub (`fg-c2` branch)** and free tunnels with zero paid servers.
+This plan upgrades **FunGuys** to operate under **Model A (The "Player-Coach" 5-Agent Swarm Architecture)** while closing the remaining gaps identified in the 9-point capability audit:
 
----
-
-## 2. Model & Usage-Rate Routing Matrix
-
-### 2.1 Planning & Main Controller Priority Order
-When selecting the Lead Architect or Main Controller Agent across all connected machines, the Host always picks in order of **highest usage allowance**:
-1. **1st Choice — Claude `opus` (`high`)**: Highest usage rate for deep reasoning; also capable of hard coding.
-2. **2nd Choice — Google `argon` (`medium`)**: Second-highest planning allowance; strictly reserved for planning/steering (no coding).
-3. **3rd Choice — ChatGPT `astra` (`low`)**: Tightest usage rate limit; used for planning only when neither Claude nor Google is available, at `low` effort to conserve Astra quota.
-
-### 2.2 Per-Provider Model & Effort Table (Important Work vs. Gruntwork)
-| Work Classification (Set by Main Controller) | 1st Priority: Claude (`claude`) | 2nd Priority: Google (`gemini` / `agy`) | 3rd Priority: ChatGPT (`codex`) |
-| :--- | :--- | :--- | :--- |
-| **1. Planning & Controller** *(Zero Coding)* | **`opus` (`high`)** *(1st Default)* | **`argon` (`medium`)** *(2nd Default)* | **`astra` (`low`)** *(3rd Default)* |
-| **2. Important Work (`important_coding`, Tier 1)** *(Core logic, complex or large critical tasks)* | **`opus` (`high`)** | **`argon` (`low`)** *(Fallbacks to **`flash` (`high`)** only if Argon quota is exhausted)* | **`sol` (`high`)** *(Handles all coding so Astra is untouched)* |
-| **3. Gruntwork (`gruntwork`, Tier 2)** *(Boilerplate, CRUD, simple UI, config, docs)* | **`opus` (`medium`)** | **`flash` (`high`)** *(100% offloaded from Argon)* | **`sol` (`high`)** |
-| **4. Testing & QA (`testing`, Tier 2)** *(All test authoring & verification fixes)* | **`opus` (`medium`)** | **`flash` (`high`)** *(100% offloaded from Argon)* | **`sol` (`high`)** |
-| **Hard Floor** *(Never go lower than)* | **`opus` (`medium`)** | **`flash` (`high`)** | **`sol` (`high`)** |
-
-### 2.3 How the Main Controller Separates Important Work from Gruntwork
-1. **Semantic Classification Over Blind Size Heuristics**:
-   - A large task can still be **mission-critical**. Instead of a naive token-size check that would mistakenly downgrade an important large task to a weaker model, the **Main Controller Agent** (`opus:high` $\to$ `argon:medium` $\to$ `astra:low`) explicitly tags every task with `task_role`:
-     - `"important_coding"` (`complexity_tier = 1`): Routed to **`argon:low`** (Google), **`opus:high`** (Claude), or **`sol:high`** (ChatGPT).
-     - `"gruntwork"` (`complexity_tier = 2`): Routed directly to **`flash:high`** (Google), **`opus:medium`** (Claude), or **`sol:high`** (ChatGPT).
-     - `"testing"` (`complexity_tier = 2`, `require_tests = True`): Routed directly to **`flash:high`**, **`opus:medium`**, or **`sol:high`**.
-2. **Splitting Large Important Tasks into Core + Gruntwork**:
-   - When the Main Controller sees a large important feature, it splits the **critical core engine** into an `"important_coding"` task (for `argon:low` / `opus:high` / `sol:high`) and splits the **surrounding boilerplate, scaffolding, and tests** into `"gruntwork"` and `"testing"` tasks (for `flash:high` / `opus:medium` / `sol:high`).
-3. **Dual-Bucket Usage Tracking & Exhaustion Fallback (`argon-low` $\to$ `flash-high`)**:
-   - Tracks `high_tier_used_pct` (Argon / Astra / Opus-High bucket) separately from `used_pct` (Flash-High / Sol-High / Opus-Medium bucket).
-   - Because all `"gruntwork"` and `"testing"` on Google run directly on **`flash:high`**, **100% of the Argon coding budget is saved exclusively for `"important_coding"` (`argon:low`)** and `"planning"` (`argon:medium`).
-   - Only if the Argon bucket actually runs out (`>= 85%` or hits a `429` rate limit mid-task) does `"important_coding"` fall back to `flash:high` so work never stalls.
+1. **Model A ("Player-Coach" Swarm Utilization)**:
+   - All **5 connected agents actively write code**—no agent is wasted sitting idle on the sidelines as a pure manager.
+   - The **Main Controller Agent** (elected by planning headroom priority: **1st: Claude `opus:high` $\to$ 2nd: Google `argon:medium` $\to$ 3rd: ChatGPT `astra:low`**) plans the initial `CONTRACTS.md` and Task DAG, then rolls up its sleeves to execute critical Tier-1 `"important_coding"` tasks alongside the other 4 workers.
+2. **Feature #9 — Mid-Work Task Drop & Baton Pass on Controller Promotion / Dispute Call**:
+   - Whenever an active coding agent is promoted to **Main Controller**, or when the currently coding Controller is called upon mid-task to **arbitrate a worker dispute**, it immediately performs a **non-destructive task drop**:
+     1. Cleanly interrupts its active coding subprocess.
+     2. Checkpoints its uncommitted work-in-progress (WIP) files to a candidate Git branch (`refs/heads/wip/<task_id>`).
+     3. Generates a structured Baton Pass handoff digest (`create_handoff_document`).
+     4. Transitions the task to `HANDOFF_PENDING` so an idle worker can take over—**or, if all other workers are busy, sets `preferred_agent_id` back to the Controller so it automatically resumes its exact same task from its Git checkpoint as soon as arbitration finishes**.
+3. **Feature #2 — Explicit Controller Arbitration Instructions & Worker Dispute Protocol (`@FG:DISPUTE`)**:
+   - **Worker Problem Detection & Escalation**: Workers receive explicit instructions in `task_prompt()` on how to recognize blocking problems (terminal/import errors, `CONTRACTS.md` mismatches, Blackboard `[LOCK]`/`[TRIPWIRE]` collisions, or QA failures outside their assigned `target_files`) and escalate immediately via `@FG:DISPUTE <target> <reason>` instead of inventing hacks.
+   - **Controller Arbitration Turn**: When a dispute is raised, the Host frees the Controller (via Feature #9) and invokes an authoritative arbitration turn (`run_text_agent` with `role="planning"`). The Controller receives full instructions on its duties: inspect the conflicting files and contracts, issue a binding decision, update `CONTRACTS.md` / Blackboard facts, and emit `@FG:STEER`, `@FG:HOLD`, `@FG:GO`, or `@FG:VETO` directives that stream directly into the affected workers' `.funguys_inbox.md` files without restarting them.
+4. **Feature #4 — On-Demand Context Window Reset & Targeted Handoff (`@FG:HANDOFF` & `/api/agents/{id}/handoff`)**:
+   - Any specific agent can have its context window reset on demand (by the Controller, the human admin, or the agent itself) without triggering a 60-minute quota cooldown.
+   - Its WIP files are checkpointed to Git, a Baton Pass handoff digest is created, and the task is routed either to a **specifically selected target agent** (`target_agent_id`) or back to a fresh, clean CLI session of the same agent.
 
 ---
 
-## 3. Self-Audit Corrections Applied to This Plan
+## 2. End-to-End Workflow: How Model A + Feature #9 + Dispute Resolution Works
 
-Upon re-auditing the plan against the repository's 55-test regression suite (`tests/`), **6 critical traps** were identified and corrected so the coding agent will not break existing functionality:
+```mermaid
+sequenceDiagram
+    autonumber
+    actor W2 as Worker 2 (Gemini - Frontend)
+    participant Host as FunGuys Host Orchestrator
+    actor Ctrl as Controller (Claude Opus - Coding Task 1)
+    actor W3 as Worker 3 (Busy or Idle)
 
-1. **Standalone `/worker.py` Single-File Constraint (`funguys/worker/runtime.py`)**:
-   - *Trap*: Remote workers join via `/join.ps1` or `/join.sh` by downloading **only** `funguys/worker/runtime.py` (`/worker.py`) and running it with standard-library Python—without the `funguys` package installed. If `runtime.py` imported `from funguys.protocol import ...`, standalone workers on other laptops would crash with `ModuleNotFoundError`.
-   - *Correction*: All core wire-protocol parsing (`parse_raw_signals`), model-tier resolution (`select_model_and_effort`), error compression (`compress_error_log`), and compact prompt building (`task_prompt`) are implemented directly inside `funguys/worker/runtime.py` using 100% Python standard library, and re-exported by `funguys/protocol.py` for the Host.
-2. **Tier-Routing Test Compatibility (`funguys/config.py` & `funguys/host/orchestrator.py`)**:
-   - *Trap*: `test_plan_approval_gate_and_role_based_tier_routing` registers `claude-max` (Tier 1, 50% used) and `gemini-cli` (Tier 2, 10% used) and asserts that a Tier-1 task routes to `claude-max`.
-   - *Correction*: Ranking **Claude (`opus:high`) > ChatGPT (`sol:high`) > Google (`argon:low` / `flash:high`)** naturally routes Tier-1 tasks to `claude-max` first while allowing fallback to other providers when Claude is absent.
-3. **Preserving Test Fixtures (`funguys/host/demo.py`, `adapters.py`, `mcp_bridge/server.py`)**:
-   - *Trap*: Existing tests (`test_orchestrator_e2e.py`, `test_workflow_regressions.py`, `test_concurrency_recovery.py`) explicitly import `generate_task_code_artifact`, `/api/simulate/hackathon`, `public_destination`, and `fetch_public_page`.
-   - *Correction*: Keep those functions in place (they use 0 LLM tokens at runtime) and add the new `MCPWorkerServer` alongside them in `funguys/mcp_bridge/server.py`.
-4. **Host HTTP Middleware Worker Permissions (`funguys/host/app.py:228`)**:
-   - *Trap*: `app.py` has a strict allowlist of URL paths that `role == 'worker'` tokens can call.
-   - *Correction*: Explicitly add `/api/controller/signal` and `/api/blackboard` to the worker path allowlist in `authorize()`.
-5. **`/btw` Side Conversation Regression Compatibility (`funguys/host/orchestrator.py:728`)**:
-   - *Trap*: `test_btw_side_conversation_lifecycle_and_guidance` monkeypatches `adapters.run_text_agent` and tests `/api/chat/ask` with a remote worker record.
-   - *Correction*: When `/btw` or `/api/chat/ask` is called, **both** enqueue the `PromptQueueItem` into the worker's live inbox (`store.enqueue_prompt`) **and** attempt `run_text_agent` inside a `try/except` fallback.
-6. **Playwright QA Check Compatibility (`funguys/host/qa_pipeline.py:176`)**:
-   - *Trap*: `test_browser_failure_is_not_a_pass_and_checks_are_honest` calls `_run_playwright_check(task, 1, 'http://127.0.0.1:1/missing')` on a task where `require_browser=False`.
-   - *Correction*: Always run Playwright if `live_preview_url` is explicitly provided OR `task.require_browser` is `True` OR any file in `task.target_files` is an HTML/frontend file; only skip when `not live_preview_url and not task.require_browser` and the task only targets backend files.
+    Note over W2: Detects problem: backend/service.py signature violates CONTRACTS.md
+    W2->>Host: Emits @FG:DISPUTE backend/service.py Return type mismatch vs CONTRACTS.md
 
----
+    Note over Host: Step 1: Feature #9 Clean Task Drop on Controller
+    Host->>Ctrl: Signals interrupt to Task 1 coding subprocess
+    Ctrl-->>Host: Commits WIP files to Git (refs/heads/wip/task-1)
+    Host->>Host: Sets Task 1 = HANDOFF_PENDING (preferred_agent_id = Ctrl if all workers busy)
 
-## 4. How the Coordination Protocol Works (ExploitGym Style, Zero Bloat)
+    Note over Ctrl: Step 2: Feature #2 Controller Arbitration Turn
+    Host->>Ctrl: Invokes Controller Arbitration Prompt (Dispute + Contracts + File Excerpts)
+    Ctrl-->>Host: Emits @FG:FACT, @FG:STEER W1, @FG:STEER W2
 
-Instead of agents chatting in conversational paragraphs, agents communicate with the **Main Controller Agent** via single-line directives at the end of their output or via MCP tool calls:
+    Note over Host: Step 3: Live Delivery & Controller Resume
+    Host->>W2: Appends ruling to .funguys_inbox.md (no worker restart)
+    Host->>Ctrl: Re-assigns Task 1 from WIP Git checkpoint (since W3 is busy)
+    Note over Ctrl: Resumes coding Task 1 right where it left off!
+```
 
-| Signal | Format | Purpose | Token Cost |
-| :--- | :--- | :--- | :--- |
-| **`CLAIM`** | `@FG:CLAIM :: src/auth.py,src/db.py` | Locks files on the Blackboard before editing to prevent Git merge conflicts. | ~10 tokens |
-| **`RELEASE`** | `@FG:RELEASE :: *` | Releases file locks held by the agent. | ~5 tokens |
-| **`FACT`** | `@FG:FACT :: api:auth_header=X-Token` | Posts a shared discovery to the Blackboard so other agents don't waste turns rediscovering it. | ~15 tokens |
-| **`TRIPWIRE`** | `@FG:TRIPWIRE :: build:vitest needs --run flag` | Warns all agents of a dead-end or environment trap. | ~15 tokens |
-| **`TRIGGER`** | `@FG:TRIGGER TARGET=role:testing TASK=task-3 :: Run unit tests on new auth module` | Asks the Main Controller to wake up a testing agent (`flash-high` / `sol-high` / `opus-medium`). | ~25 tokens |
-| **`STEER`** | `@FG:STEER TARGET=agent-abc TASK=task-2 :: Rename login() to authenticate()` | Queues a live steering instruction into another agent's `.funguys_inbox.md` without killing its process. | ~25 tokens |
-| **`HOLD` / `GO`** | `@FG:HOLD TASK=task-2 :: Waiting on schema migration` | Pauses or unblocks a downstream task/agent. | ~15 tokens |
-| **`VETO`** | `@FG:VETO TASK=task-1 :: Circular dependency in spec; need Controller redesign` | Halts a broken task approach and escalates to the Main Controller (`opus-high` $\to$ `argon-medium` $\to$ `astra-low`). | ~20 tokens |
-
----
-
-## 5. Existing Codebase Bugs We Are Fixing
-
-1. **macOS Environment Stripping (`funguys/host/execution.py:32`)**: `SandboxRunner` stripped `HOME`, `USERPROFILE`, and `APPDATA`, breaking Playwright, Node, and CLIs on macOS and Windows.
-2. **macOS CLI Path Blindness (`funguys/worker/runtime.py:108`)**: Non-interactive shells on Mac miss `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` (Claude CLI), and `~/.nvm` (Codex/Gemini CLI).
-3. **macOS `os.killpg` Race Condition (`funguys/worker/runtime.py:139`)**: Uncaught `ProcessLookupError`/`PermissionError` when killing exiting process groups on macOS BSD kernel.
-4. **Heartbeat Cancellation Destroys Work (`funguys/worker/runtime.py:293-325`)**: Any update to `handoff_digest` (like a `/btw` note or contract alert) killed the running worker CLI and returned before saving WIP changes.
-5. **Unbounded Error Logs in Worker Prompts (`funguys/worker/runtime.py:191`)**: Up to 100KB of raw terminal output in `last_error` was dumped verbatim into retry prompts.
-6. **Middle-Prompt Truncation & Claude `--tools ""` Bug (`funguys/worker/adapters.py:34,44`)**: Naive `prompt[:3000] + prompt[-3000:]` slicing broke structured prompts, and passing `--tools ""` broke newer Claude Code CLIs.
-7. **Host Restart Forces Trusted Execution (`funguys/host/app.py:280`)**: `/api/host/restart` forced `FUNGUYS_TRUSTED_EXECUTION=1` and dropped `--port`/`--host`/`--tunnel` flags.
-8. **Missing `psutil` Dependency (`funguys/host/tunnel.py:20`)**: `get_lan_ip()` imported `psutil` which is not in `pyproject.toml`.
+### Key Questions Answered by This Design
+1. **What if all other workers are busy when the Controller drops its task to solve a dispute?**
+   - When the Controller drops its task for dispute arbitration, `preferred_agent_id` defaults to the Controller's own `agent_id` if no other qualified worker is idle.
+   - Because `HANDOFF_PENDING` tasks sort to the very top of `schedule_ready_tasks()`, the moment the Controller finishes its 1-turn arbitration ruling, the scheduler immediately hands the task back to the Controller with its saved Git WIP branch (`task.candidate_revision`) intact.
+2. **How does a worker know it has hit a problem?**
+   - **Feedback Loop 1 (CLI Tool Stderr):** Running `pytest`, `python`, or `tsc` inside its scratchpad reveals `ImportError`, `AttributeError`, or schema errors in dependencies.
+   - **Feedback Loop 2 (`CONTRACTS.md` Comparison):** Reading existing workspace files before editing reveals signature or return-type deviations from the agreed contract slice.
+   - **Feedback Loop 3 (Blackboard Locks & Tripwires):** `.funguys_inbox.md` and `blackboard_digest` show `[LOCK]` or `[TRIPWIRE]` on files the worker needs.
+   - **Feedback Loop 4 (Host QA Retry Logs):** Compressed QA failure logs show integration failures caused by files outside the worker's assigned `target_files`.
+3. **How does on-demand Context Window Reset (#4) differ from Quota Cooldown?**
+   - Previously, handoffs only happened when an agent hit `used_pct >= 80%` or a `429` rate limit, which locked the agent in `COOLDOWN` for hours.
+   - With `POST /api/agents/{id}/handoff` (and `@FG:HANDOFF <agent_id> [target_agent_id]`), any agent's active subprocess is cleanly stopped, its WIP is saved to Git, its context window is wiped clean (since the next CLI invocation starts a fresh process), and the agent remains `IDLE` and ready—while the task is passed to the chosen successor agent (or resumed with a clean context window).
 
 ---
 
-## 6. 100% Free Laptop-Only Operation (No Paid Server Required)
+## 3. Summary of New Primitives Being Added
 
-1. **GitHub `fg-c2` Branch Rendezvous (`funguys/host/git_c2.py`)**:
-   - Whenever the Host starts or updates its free Cloudflare Quick Tunnel (`trycloudflare.com`) or LAN IP, it pushes a lightweight beacon (`c2_beacon.json`) to an orphan branch `fg-c2` on your GitHub repo using fast Git plumbing commands (without touching your working branch).
-   - If the Host laptop sleeps, wakes up, or changes Wi-Fi and gets a new free tunnel URL, workers automatically read `origin/fg-c2` from GitHub to discover the new URL and stay connected.
-2. **Laptop Sleep Prevention (`LaptopKeepAwake`)**:
-   - Uses native `caffeinate -di` on macOS and `SetThreadExecutionState` on Windows so laptops never go to sleep while coordinating or executing tasks.
+| Primitive / Endpoint | Layer | Purpose |
+| :--- | :--- | :--- |
+| **`@FG:DISPUTE <target> <reason>`** | Signal Protocol | Emitted by any worker when it encounters a contract contradiction, locked file dependency, or cross-task bug requiring Controller arbitration. |
+| **`@FG:HANDOFF <agent_id> [target_agent_id] [notes]`** | Signal Protocol | Triggers an immediate context-window reset and WIP Baton Pass for `<agent_id>`, optionally routing the task to `[target_agent_id]`. |
+| **`POST /api/agents/{agent_id}/handoff`** | Host REST API | On-demand endpoint to checkpoint an agent's WIP, reset its context window without cooldown, and hand off its task to a chosen agent. |
+| **`POST /api/controller/arbitrate`** | Host REST API | Explicitly triggers the Main Controller to drop its current task (if coding), arbitrate a dispute, and steer affected workers. |
+| **`orch.drop_task_for_controller(agent_id, reason)`** | Orchestrator (#9) | Checkpoints active WIP, marks the task `HANDOFF_PENDING`, frees the agent to `IDLE`, and preserves `preferred_agent_id` so the Controller can resume if all workers are busy. |
+| **`orch.handoff_agent_task(...)`** | Orchestrator (#4) | Performs an on-demand context window reset + WIP checkpoint + targeted agent handoff without putting the agent into quota cooldown. |
+| **`orch.arbitrate_dispute(...)`** | Orchestrator (#2) | Runs the Controller arbitration prompt (`opus:high` $\to$ `argon:medium` $\to$ `astra:low`), parses C2 rulings, and delivers them to workers' `.funguys_inbox.md`. |
+| **`fg_dispute` & `fg_handoff`** | MCP IDE Bridge | New MCP stdio tools allowing Cursor / Windsurf / Claude Desktop agents to raise disputes or trigger clean handoffs. |
+
+---
+
+## 4. Files Modified by This Upgrade
+
+1. **`funguys/models.py`**:
+   - Add `DISPUTE = "DISPUTE"` and `HANDOFF = "HANDOFF"` to `SignalOp`.
+   - Add `HandoffAgentRequest` and `ArbitrateDisputeRequest` Pydantic models.
+2. **`funguys/worker/runtime.py` & `funguys/protocol.py`**:
+   - Expand `SIGNAL_PATTERN` to parse `DISPUTE` and `HANDOFF`.
+   - Add `controller_arbitration_prompt()` so the Main Controller has explicit instructions on how to arbitrate disputes and supervise the swarm.
+   - Update `task_prompt()` with the 4-loop problem detection & `@FG:DISPUTE` / `@FG:HANDOFF` escalation rules for workers.
+   - Update `WorkerRuntime.heartbeat_loop` and `_perform_assignment` so when a worker or controller is interrupted for a handoff or controller promotion (`mode == "handoff"` or `mode == "interrupt"`), it uploads its WIP files to the new `/api/agents/{id}/handoff` endpoint without marking itself rate-limited.
+3. **`funguys/host/orchestrator.py`**:
+   - Implement `handoff_agent_task()` (Feature #4: context window reset + WIP checkpoint + target agent selection).
+   - Implement `drop_task_for_controller()` and wire it into `designate_controller()`, `_ensure_controller_elected()`, and `arbitrate_dispute()` (Feature #9).
+   - Implement `arbitrate_dispute()` and wire `@FG:DISPUTE` and `@FG:HANDOFF` into `process_signals()` (Feature #2).
+4. **`funguys/host/app.py`**:
+   - Expose `POST /api/agents/{agent_id}/handoff` and `POST /api/controller/arbitrate`.
+   - Update `select_architect()` so if the elected local Controller is currently `WORKING` on a coding task when planning/interview is requested, it automatically invokes `drop_task_for_controller()` instead of raising `ConflictError`.
+5. **`funguys/mcp_bridge/server.py`**:
+   - Add `fg_dispute` and `fg_handoff` tools to `MCP_TOOLS` and `MCPWorkerServer.handle_call_tool()`.
+6. **`tests/test_c2_controller_and_mcp.py`**:
+   - Add automated tests covering Feature #9 (controller promotion drops task, checkpoints WIP, and resumes if all workers are busy), Feature #2 (`@FG:DISPUTE` triggers controller arbitration and live-steers workers), and Feature #4 (on-demand context window reset and targeted handoff to another agent).
