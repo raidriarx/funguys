@@ -15,8 +15,8 @@ FunGuys coordinates coding tasks across teammates' installed Claude, ChatGPT/Cod
 - **On-Demand Context Handoff**: Agents can reset context windows or transfer tasks on demand (`@FG:HANDOFF` / `POST /api/agents/{id}/handoff`) without being locked in a 60-minute quota cooldown.
 - **Work-Importance Model Routing**: Routes tasks by architectural importance (`planning`, `important_coding`, `gruntwork`, `testing`) rather than token volume, preserving top-tier reasoning quotas.
 - **Dual-Bucket Quota Management**: Separates heavy reasoning turns (`opus:high`, `argon`, `astra`) from high-throughput workhorse turns (`flash:high`, `sol:high`, `opus:medium`), automatically falling back when quotas exceed 85%.
-- **Non-Destructive Live Steering & `/btw` Inboxes**: Mid-run directives and `/btw` notes stream in real-time into `.funguys_inbox.md` inside the worker's active workspace without crashing or resetting progress.
-- **Desktop IDE Integration (stdio MCP)**: Connect Cursor, Windsurf, Claude Desktop, or VS Code into the swarm via standard Model Context Protocol tools (`fg_get_assignment`, `fg_heartbeat`, `fg_submit_task`, `fg_dispute`, `fg_handoff`, `fg_blackboard`, `fg_graphify`).
+- **Non-Destructive Live Steering & Network `/btw` Terminal**: Mid-run directives and `/btw` notes stream in real-time into `.funguys_inbox.md` inside the worker's active workspace without crashing or resetting progress. Any teammate can steer via the web Swarm Terminal, the `funguys btw "<msg>"` CLI command, interactive worker console input, or desktop IDE MCP.
+- **Desktop IDE Integration (stdio MCP)**: Connect Cursor, Windsurf, Claude Desktop, or VS Code into the swarm via standard Model Context Protocol tools (`fg_get_assignment`, `fg_heartbeat`, `fg_submit_task`, `fg_dispute`, `fg_handoff`, `fg_btw`, `fg_blackboard`, `fg_graphify`).
 - **Serverless GitHub State Sync**: Persists the project DAG, blackboard, and discovery beacons to an orphan `refs/heads/fg-c2` branch so remote nodes sync state without paid cloud infrastructure.
 - **Laptop Keep-Awake**: Built-in sleep prevention for Windows (`SetThreadExecutionState`), macOS (`caffeinate`), and Linux (`systemd-inhibit`) to ensure long builds run uninterrupted.
 - **Token Efficiency**: Automated `CONTRACTS.md` slicing for target files and ANSI/pointer log scrubbing for minimal LLM token consumption.
@@ -98,6 +98,7 @@ Available IDE tools:
 - `fg_submit_task`: Submit completed code directly into the 3-layer automated QA pipeline.
 - `fg_dispute`: Escalate blockers or contract contradictions to the Controller.
 - `fg_handoff`: Request on-demand context reset or task delegation.
+- `fg_btw`: Send `/btw` guidance to the Main Controller to steer active workers non-destructively.
 - `fg_blackboard`: Read or post to the shared architectural blackboard.
 - `fg_graphify`: Query repository AST and symbol cross-references.
 
@@ -107,7 +108,11 @@ Available IDE tools:
 
 1. **Lead Architect Interview ("Grill-Me")**: Start an interactive interview in Mission Control. The elected leader AI grills the requirements, scans any existing workspace code, and compiles a comprehensive `CONTRACTS.md` and multi-phase Task DAG.
 2. **Review & Approve**: Review interface contracts and tasks. Explicitly approve the plan version to unlock worker scheduling.
-3. **In-Flight Guidance (`/btw`)**: Type `/btw <guidance>` in chat or send an `@FG:STEER` signal to guide active workers. Guidance appends to `.funguys_inbox.md` without killing the active process.
+3. **In-Flight Guidance (`/btw`)**: Steer active workers without stopping their processes:
+   - **From Any Terminal:** Run `uv run funguys btw "your guidance"` or type `/btw <guidance>` directly into any running worker console.
+   - **From the Web Dashboard:** Type in the **Swarm Terminal** at `http://<host-ip>:8420` (sign in with your admin token or teammate `worker_token`).
+   - **From Desktop IDEs:** Use the `fg_btw` tool in Cursor, Windsurf, Claude Desktop, or VS Code.
+   - The Main Controller triages the note, emits targeted `@FG:STEER` directives, and streams guidance into the worker's `.funguys_inbox.md` without killing the active process.
 4. **Automated 3-Layer QA Verification**: Submitted code is tested inside isolated Git worktrees (`funguys-qa:local` Docker container or host sandbox with `FUNGUYS_TRUSTED_EXECUTION=1`). Merges only proceed when all checks pass.
 
 ---
@@ -120,7 +125,7 @@ Run the complete test suite:
 uv run pytest -v
 ```
 
-All 66 automated tests cover bootstrap syntax, browser dashboard integration, Main Controller C2 primitives, MCP stdio dispatch, Git C2 sync, concurrency resilience, Model A Player-Coach mid-work task handoffs, dispute arbitration, and end-to-end hackathon simulation.
+All 67 automated tests cover bootstrap syntax, browser dashboard integration, Main Controller C2 primitives, MCP stdio dispatch, Git C2 sync, concurrency resilience, Model A Player-Coach mid-work task handoffs, dispute arbitration, network-wide `/btw` steering and task self-reclaim, and end-to-end hackathon simulation.
 
 ---
 

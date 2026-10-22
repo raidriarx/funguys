@@ -90,7 +90,15 @@ uv run funguys join <HOST_URL> [OPTIONS]
 - `--token <str>`: Invite token or saved worker credential (can also be passed via `FUNGUYS_WORKER_TOKEN`).
 - `--used-pct <float>`: Initial quota usage percent (0–100).
 
-### 3. `funguys mcp-worker`
+### 3. `funguys btw`
+Sends a `/btw` live steering note directly to the Main Controller from any terminal window without opening a browser:
+```powershell
+uv run funguys btw "<MESSAGE>" [OPTIONS]
+```
+- `--host-url <str>`: URL of the running FunGuys host (default: `http://localhost:8420`).
+- `--token <str>`: Worker token or admin token (reads `.funguys/admin_token` automatically if present on host).
+
+### 4. `funguys mcp-worker`
 Launches a JSON-RPC 2.0 stdio Model Context Protocol (MCP) server so desktop IDEs (Cursor, Windsurf, VS Code, Claude Desktop) can act as swarm workers or Controllers.
 ```powershell
 uv run funguys mcp-worker [OPTIONS]
@@ -101,13 +109,13 @@ uv run funguys mcp-worker [OPTIONS]
 - `--profile, -p <str>`: Profile key (default: `mcp-ide`).
 - `--controller / --no-controller`: Promote this IDE agent to Main Controller on launch (default: `no-controller`).
 
-### 4. `funguys graph`
+### 5. `funguys graph`
 Inspects workspace dependencies, AST symbols, and cross-file relationships using the built-in Graphify engine.
 ```powershell
 uv run funguys graph [WORKSPACE] --query <QUERY>
 ```
 
-### 5. `funguys simulate`
+### 6. `funguys simulate`
 Runs a disposable multi-agent hackathon simulation without modifying your real Git project repository or database state.
 ```powershell
 uv run funguys simulate
@@ -124,11 +132,12 @@ FunGuys uses a two-tier authentication model:
 - Grants full administrative privileges: restarting the host, killing agents, creating/deleting tasks, arbitrating disputes, and force-merging code.
 - **Security Rule:** Keep this token secret on the host machine. **Do not share this token with teammates.**
 
-### 2. Worker Invitations (`invite` & `worker_token`)
+### 2. Worker Invitations & Teammate Sessions (`invite` & `worker_token`)
 - Generated in Mission Control under **Workers & Invites** $\to$ **Invite a worker** (`POST /api/invites`).
 - Invite tokens expire in **1 hour** and are single-use.
-- When a teammate connects, the host enrolls them and issues a scoped `worker_token`.
-- Workers can only pull assignments, report status, stream logs, signal disputes, or request handoffs. They cannot alter host configurations or modify other workers' assignments.
+- When a teammate connects, the host enrolls them and issues a scoped `worker_token` (saved in `~/.funguys/workers/<machine>.json`).
+- **Teammate Website Sign In:** Teammates can use their `worker_token` to sign into the Mission Control website at `http://<host-ip>:8420`. They gain access to view the live dashboard (`/ws` WebSocket stream) and submit `/btw` guidance through the Swarm Terminal (`/api/chat/ask`), while destructive operations (`/api/host/restart`, deleting tasks) remain strictly locked to the Administrator.
+- **Pure Terminal Execution:** Teammates do not need to open a browser at all. They can run assignments and send `/btw` steering commands entirely inside their PowerShell or Bash window.
 
 ---
 
@@ -222,6 +231,7 @@ To attach Cursor, Windsurf, Claude Desktop, or VS Code:
    - `fg_submit_task`: Submit completed code for 3-layer QA verification.
    - `fg_dispute`: Escalate a blocking issue to the Controller.
    - `fg_handoff`: Request on-demand context reset or delegate to another agent.
+   - `fg_btw`: Send `/btw` guidance to the Main Controller to steer active workers non-destructively.
    - `fg_blackboard`: Read or post shared architecture notes.
    - `fg_graphify`: Query repository AST and symbol relationships.
 
@@ -274,9 +284,14 @@ When a worker encounters a blocker, missing dependency, or contradictory contrac
 4. **Resolution:** The Controller issues steering commands, updates contracts, or reallocates subtasks.
 5. **Self-Reclaim:** If all other workers are busy, the Controller's prior coding task sets `preferred_agent_id = ctrl_id`, allowing the Controller to automatically resume its coding task after resolving the dispute.
 
-### Live Steering & Non-Destructive Inboxes
+### Live Steering & Non-Destructive Inboxes (`/btw`)
 - **Live Steering (`POST /api/agents/{agent_id}/steer`):** Send a high-priority prompt to an agent without resetting its context.
-- **Non-Destructive Inboxes (`/btw`):** Send background notes into the worker's active workspace file `.funguys_inbox.md`. The worker reads them continuously without interrupting its execution.
+- **Network-Wide `/btw` Steering:** Send background notes to active workers without interrupting or restarting their coding subprocess:
+  - **In Running Worker Consoles:** Teammates can type `/btw <guidance>` directly into their active PowerShell/Bash worker window and hit Enter.
+  - **CLI One-Liner:** Run `uv run funguys btw "<guidance>"` from any terminal.
+  - **Swarm Terminal on Web:** Type in the **Swarm Terminal** at `http://<host-ip>:8420`.
+  - **IDE MCP:** Call the `fg_btw` tool from Cursor, Windsurf, Claude Desktop, or VS Code.
+- **Controller-Mediated Triage & Self-Reclaim:** The Main Controller evaluates the `/btw` against the swarm roster, emits targeted `@FG:STEER` directives, and streams the guidance into `.funguys_inbox.md`. If the Controller was coding a separate task when the `/btw` arrived, it checkpoints its task to Git, triages the note, and automatically reclaims its own task afterward.
 
 ---
 
@@ -328,11 +343,13 @@ FunGuys monitors worker rate limits to prevent model exhaustion:
 ### Core Endpoints
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `POST` | `/api/session` | Sign in with administrator token. |
-| `DELETE` | `/api/session` | Log out of administrator session. |
+| `POST` | `/api/session` | Sign in with administrator token or teammate worker token. |
+| `DELETE` | `/api/session` | Log out of administrator or worker session. |
 | `POST` | `/api/invites` | Create a 1-hour single-use worker invite token. |
 | `GET` | `/api/state` | Full JSON state dump (agents, tasks, blackboard, stats). |
-| `WS` | `/ws` | Real-time WebSocket event broadcast stream. |
+| `WS` | `/ws` | Real-time WebSocket event broadcast stream (admin & worker authenticated). |
+| `POST` | `/api/chat/ask` | Send a project question or `/btw` live steering note (triaged by Controller). |
+| `POST` | `/api/chat/btw/end` | Close an active `/btw` side-conversation and commit guidance to task digest. |
 
 ### Agents & Controller
 | Method | Endpoint | Description |
