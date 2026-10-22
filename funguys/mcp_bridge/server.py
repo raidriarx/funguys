@@ -179,6 +179,18 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "fg_btw",
+        "description": "Send a network-wide `/btw` live steering guidance message to the Main Controller so it triages and streams guidance to active workers without interrupting their tasks.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "The `/btw` guidance or question for the Main Controller"},
+                "preferred_agent_id": {"type": "string", "description": "Optional target agent ID (defaults to 'auto' for Controller triage)"},
+            },
+            "required": ["message"],
+        },
+    },
+    {
         "name": "fg_submit",
         "description": "Submit completed file changes for the currently assigned task to the Host 3-layer QA pipeline.",
         "inputSchema": {
@@ -304,6 +316,18 @@ class MCPWorkerServer:
                     "mode": arguments.get("mode", "steer"),
                     "task_id": arguments.get("task_id"),
                     "sender_agent_id": agent_id,
+                },
+            )
+        if name == "fg_btw":
+            msg = (arguments.get("message") or "").strip()
+            if not msg.lower().startswith("/btw"):
+                msg = "/btw " + msg
+            return self._request(
+                "POST",
+                "/api/chat/ask",
+                {
+                    "question": msg,
+                    "preferred_agent_id": arguments.get("preferred_agent_id", "auto"),
                 },
             )
         if name == "fg_submit":

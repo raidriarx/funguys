@@ -465,3 +465,115 @@ def test_feature_4_on_demand_context_window_reset_and_targeted_handoff(tmp_path)
         assert "WIP checkpoint from first agent" in snap["files"].get("backend/service.py", "")
     finally:
         app.state.host_lock.release()
+
+
+def test_network_btw_routes_to_controller_and_resumes_tasks(tmp_path: Path, monkeypatch) -> None:
+    """Verify any teammate on the network can sign in and send /btw, routing through the Main Controller while preserving both Worker and Controller tasks."""
+    from funguys.worker import adapters
+
+    app = create_host_app(tmp_path, admin_token="secret-admin-token")
+    client = TestClient(app)
+    try:
+        assert client.post("/api/session", json={"token": "secret-admin-token"}).status_code == 200
+
+        # Add a second parallel ready task so both Controller and Worker are actively coding different tasks
+        add_resp = client.post(
+            "/api/tasks",
+            json={
+                "id": "task-parallel-2",
+                "title": "Parallel Rate Limiter",
+                "description": "Implement sliding window rate limiter.",
+                "phase": 1,
+                "complexity_tier": 1,
+                "target_files": ["backend/limiter.py"],
+                "dependencies": [],
+                "verification_commands": [],
+            },
+        )
+        assert add_resp.status_code == 200, add_resp.text
+
+        ctrl = client.post(
+            "/api/agents/register",
+            json={
+                "owner_name": "LeadCtrl",
+                "machine_name": "ctrl-node",
+                "profile_key": "claude-opus",
+                "worker_id": "worker-btw-ctrl",
+                "executor": "remote",
+                "is_controller": True,
+            },
+        ).json()
+        worker = client.post(
+            "/api/agents/register",
+            json={
+                "owner_name": "TeammateWorker",
+                "machine_name": "worker-node",
+                "profile_key": "gemini-argon-flash",
+                "worker_id": "worker-btw-teammate",
+                "executor": "remote",
+            },
+        ).json()
+        worker_token = worker["worker_token"]
+
+        state0 = client.get("/api/state").json()
+        approved = client.post("/api/project/approve", json={"plan_version": state0["project"]["plan_version"]}).json()
+
+        ctrl_after = next(a for a in approved["agents"] if a["id"] == ctrl["id"])
+        worker_after = next(a for a in approved["agents"] if a["id"] == worker["id"])
+        assert ctrl_after["status"] == "working"
+        assert worker_after["status"] == "working"
+        ctrl_task_id = ctrl_after["current_task_id"]
+        worker_task_id = worker_after["current_task_id"]
+        assert ctrl_task_id != worker_task_id
+
+        # Mock run_text_agent so when Controller triages /btw, it also emits an explicit @FG:STEER to the worker
+        def fake_consult(provider, prompt, **kwargs):
+            return f"Acknowledged /btw guidance. Routing to active worker.\n@FG:STEER {worker['id']} Use sliding window counter in limiter"
+
+        monkeypatch.setattr(adapters, "run_text_agent", fake_consult)
+
+        # Teammate signs into website using their worker_token and sends /btw via the Swarm Terminal
+        teammate_login = client.post("/api/session", json={"token": worker_token})
+        assert teammate_login.status_code == 200
+        assert teammate_login.json()["role"] == "worker"
+
+        # Teammate can send /btw using their worker_token
+        btw_resp = client.post(
+            "/api/chat/ask",
+            headers={"Authorization": f"Bearer {worker_token}"},
+            json={"question": "/btw ensure rate limiter uses sliding window", "preferred_agent_id": "auto"},
+        )
+        assert btw_resp.status_code == 200, btw_resp.text
+        btw_entry = btw_resp.json()
+
+        # 1. Verify the Main Controller answered the /btw
+        assert btw_entry["is_btw"] is True
+        assert btw_entry["agent_id"] == ctrl["id"]
+        assert btw_entry["target_agent_id"] == worker["id"]
+
+        # 2. Verify neither the Worker nor the Controller lost their active task!
+        state1 = client.get("/api/state", headers={"Authorization": "Bearer secret-admin-token"}).json()
+        ctrl_final = next(a for a in state1["agents"] if a["id"] == ctrl["id"])
+        worker_final = next(a for a in state1["agents"] if a["id"] == worker["id"])
+
+        # Worker was never interrupted
+        assert worker_final["status"] == "working"
+        assert worker_final["current_task_id"] == worker_task_id
+
+        # Controller dropped its task during triage and automatically reclaimed its own task afterward!
+        assert ctrl_final["status"] == "working"
+        assert ctrl_final["current_task_id"] == ctrl_task_id
+
+        # 3. Verify Worker's task handoff_digest and prompt queue received the /btw guidance
+        worker_task = next(t for t in state1["tasks"] if t["id"] == worker_task_id)
+        assert "sliding window" in (worker_task.get("handoff_digest") or "")
+
+        hb = client.post(
+            f"/api/agents/{worker['id']}/heartbeat",
+            headers={"Authorization": f"Bearer {worker_token}"},
+            json={"assignment_id": worker_task["assignment_id"]},
+        ).json()
+        prompts = [p["prompt"] for p in hb.get("queued_prompts", [])]
+        assert any("sliding window" in p for p in prompts)
+    finally:
+        app.state.host_lock.release()

@@ -708,6 +708,36 @@ class WorkerRuntime:
         finally:
             self.assignment = None
 
+    def send_btw(self, message):
+        text = (message or '').strip()
+        if not text:
+            return None
+        if not text.lower().startswith('/btw'):
+            text = '/btw ' + text
+        return self.request('POST', '/api/chat/ask', {'question': text, 'preferred_agent_id': 'auto'}, timeout=60)
+
+    def console_input_loop(self):
+        import sys
+        try:
+            if not sys.stdin or not sys.stdin.isatty():
+                return
+        except Exception:
+            return
+        while not self.stop.is_set():
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                cmd = line.strip()
+                if not cmd:
+                    continue
+                if cmd.lower().startswith('/btw') or cmd.startswith('?'):
+                    q = cmd[1:].strip() if cmd.startswith('?') else cmd
+                    res = self.request('POST', '/api/chat/ask', {'question': q, 'preferred_agent_id': 'auto'}, timeout=60)
+                    print(f"\n[Controller C2]: {res.get('answer', '')}\n", flush=True)
+            except Exception as exc:
+                print(f'Console command error: {exc}', flush=True)
+
     def run(self):
         lock = self.identity_path.with_suffix('.lock').open('a+b')
         lock.seek(0)
@@ -726,7 +756,9 @@ class WorkerRuntime:
             self.register()
             thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
             thread.start()
-            print(f'Connected as {self.machine}. Waiting for assignments.', flush=True)
+            input_thread = threading.Thread(target=self.console_input_loop, daemon=True)
+            input_thread.start()
+            print(f'Connected as {self.machine}. Waiting for assignments. (Type /btw <guidance> at any time to steer via Controller)', flush=True)
             try:
                 while not self.stop.is_set():
                     try:

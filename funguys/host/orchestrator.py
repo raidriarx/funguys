@@ -1438,15 +1438,28 @@ class FunGuysOrchestrator:
         is_btw = clean_q.lower().startswith('/btw')
         btw_note = clean_q[4:].strip() if is_btw else None
 
+        controller_dropped_task = False
+        selected = None
+        target_worker = None
+
         async with self._state_lock:
             if self._planning:
                 raise ConflictError('Architect consultation is already in progress')
+            self._ensure_controller_elected()
             agents = self.store.list_agents()
             if not agents:
                 raise ConflictError('No agents are currently registered or connected.')
 
+            controller = next((a for a in agents if a.is_controller and a.status != AgentStatus.OFFLINE), None)
+            working_agents = [a for a in agents if a.status == AgentStatus.WORKING and a.current_task_id]
+
+            # Determine which active worker's task is the target of /btw guidance
+            if preferred_agent_id and preferred_agent_id != 'auto':
+                target_worker = next((a for a in agents if a.id == preferred_agent_id and a.current_task_id), None)
+            if not target_worker and working_agents:
+                target_worker = next((a for a in working_agents if not a.is_controller), None) or working_agents[0]
+
             # 1. If an active side conversation is connected, route follow-ups to that agent
-            selected = None
             if self.btw_session and self.btw_session.get('agent_id'):
                 selected = next((a for a in agents if a.id == self.btw_session['agent_id']), None)
 
@@ -1456,9 +1469,11 @@ class FunGuysOrchestrator:
                 if not selected:
                     raise ValueError('Selected agent does not exist')
 
-            # 3. Intelligent default routing (prefer Main Controller / Claude Opus High -> Gemini Argon Med -> OpenAI Astra Low)
+            # 3. Intelligent default routing (route /btw to Main Controller so it can triage and steer)
             if not selected:
-                if is_btw:
+                if is_btw and controller and controller.used_pct < controller.soft_limit_pct:
+                    selected = controller
+                elif is_btw:
                     selected = next((a for a in agents if a.status == AgentStatus.WORKING and a.current_task_id), None)
                 if not selected:
                     selected = min(
@@ -1478,6 +1493,30 @@ class FunGuysOrchestrator:
             if selected.used_pct >= selected.soft_limit_pct:
                 raise ConflictError('Selected agent has reached its soft quota limit.')
 
+            need_controller_drop = (
+                is_btw
+                and selected.is_controller
+                and selected.status == AgentStatus.WORKING
+                and bool(selected.current_task_id)
+                and target_worker is not None
+                and target_worker.id != selected.id
+            )
+
+        if need_controller_drop:
+            dropped_id = await self.drop_task_for_controller(
+                selected.id,
+                reason='Paused briefly to triage incoming /btw guidance for active swarm worker.',
+                schedule_immediately=False,
+                allow_self_reclaim=True,
+            )
+            controller_dropped_task = bool(dropped_id)
+
+        async with self._state_lock:
+            selected = self.store.get_agent(selected.id) or selected
+            if target_worker:
+                target_worker = self.store.get_agent(target_worker.id) or target_worker
+            effective_target = target_worker or selected
+
             is_side_convo = is_btw or bool(self.btw_session) or (selected.status == AgentStatus.WORKING)
 
             if is_side_convo:
@@ -1487,21 +1526,23 @@ class FunGuysOrchestrator:
                         'agent_id': selected.id,
                         'agent_codename': selected.machine_name,
                         'agent_label': selected.display_name,
-                        'task_id': selected.current_task_id,
+                        'target_agent_id': effective_target.id,
+                        'task_id': effective_target.current_task_id or selected.current_task_id,
                         'messages': [],
                         'notes': [],
                     }
                 if is_btw and btw_note:
                     self.btw_session['notes'].append(btw_note)
                     self.store.enqueue_prompt(PromptQueueItem(
-                        target_agent_id=selected.id,
-                        sender_agent_id='human-team',
+                        target_agent_id=effective_target.id,
+                        sender_agent_id=selected.id if selected.is_controller else 'human-team',
                         mode='steer',
                         prompt=btw_note,
                         priority=50,
                     ))
-                    if selected.current_task_id:
-                        task = self.store.get_task(selected.current_task_id)
+                    target_task_id = effective_target.current_task_id or selected.current_task_id
+                    if target_task_id:
+                        task = self.store.get_task(target_task_id)
                         if task:
                             prefix = f'{task.handoff_digest}\n\n' if task.handoff_digest else ''
                             task.handoff_digest = f'{prefix}[User /btw guidance]: {btw_note}'
@@ -1514,7 +1555,15 @@ class FunGuysOrchestrator:
                 self.store.save_agent(selected)
 
             project = self.store.get_project()
-            current_task = self.store.get_task(selected.current_task_id) if selected.current_task_id else None
+            active_task_id = (effective_target.current_task_id if is_btw and effective_target else None) or selected.current_task_id
+            current_task = self.store.get_task(active_task_id) if active_task_id else None
+            all_tasks = {t.id: t for t in self.store.list_tasks()}
+            roster_lines = []
+            for a in self.store.list_agents():
+                t_obj = all_tasks.get(a.current_task_id) if a.current_task_id else None
+                t_desc = f"{t_obj.id} ('{t_obj.title}', files={t_obj.target_files})" if t_obj else "None"
+                roster_lines.append(f"- {a.id} ({a.machine_name} / {a.display_name}, role={'Controller' if a.is_controller else 'Worker'}, status={a.status.value}): task={t_desc}")
+            roster_summary = '\n'.join(roster_lines)
 
         try:
             files = await asyncio.to_thread(bundle, self.git.workspace_path)
@@ -1529,7 +1578,7 @@ class FunGuysOrchestrator:
             if current_task:
                 task_info = (
                     f"\nActive Assignment Context:\n"
-                    f"You are currently working on task {current_task.id}: '{current_task.title}'\n"
+                    f"Target task {current_task.id}: '{current_task.title}' (Assigned to: {effective_target.id if effective_target else selected.id})\n"
                     f"Task Specification:\n{current_task.description}\n"
                     f"Target Files: {', '.join(current_task.target_files)}\n"
                     f"Current Task Status: {current_task.status.value}\n"
@@ -1543,15 +1592,16 @@ class FunGuysOrchestrator:
 
             prompt = (
                 f"You are {selected.display_name} on {selected.machine_name}.\n"
-                f"You are participating in a conversation with the user about the project.\n"
+                f"You are participating in a conversation with the user/team about the project.\n"
                 f"Project: {project.name}\nContracts excerpt:\n{contracts_excerpt}\n"
+                f"\nSwarm Roster:\n{roster_summary}\n"
                 f"{task_info}"
                 f"{history_info}"
                 f"Workspace Excerpts:\n{context}\n\n"
                 f"User: {clean_q}\n\n"
                 f"Answer the user's question directly, concisely, and helpfully based on the context above. "
-                f"If the user gave a '/btw' note or guidance for your current task, acknowledge it and explain briefly how it applies. "
-                f"If acting as the Main Controller, you may also emit 1-line C2 directives (`@FG:STEER <agent_id> <msg>` or `@FG:TRIGGER <task_id> <agent_id>`). "
+                f"If the user gave a '/btw' note or guidance, acknowledge it, explain briefly how it applies to the target task, "
+                f"and if acting as the Main Controller, emit 1-line C2 directives (`@FG:STEER <agent_id> <msg>`, `@FG:HANDOFF <agent_id> <reason>`, or `@FG:TRIGGER <task_id> <agent_id>`) when appropriate. "
                 f"Do not call tools or attempt file editing in this response."
             )
             try:
@@ -1576,6 +1626,7 @@ class FunGuysOrchestrator:
                     'agent_id': selected.id,
                     'agent_codename': selected.machine_name,
                     'agent_label': selected.display_name,
+                    'target_agent_id': effective_target.id if effective_target else selected.id,
                     'routing_reason': f"Side conversation with {selected.machine_name}" if is_side_convo else f"Executed by {selected.display_name}",
                     'matched_domain': 'Task /btw Guidance' if is_btw else 'Project context',
                     'is_btw': is_btw,
@@ -1591,3 +1642,5 @@ class FunGuysOrchestrator:
                     if agent and not agent.current_task_id:
                         agent.status = AgentStatus.COOLDOWN if agent.cooldown_until else AgentStatus.IDLE
                         self.store.save_agent(agent)
+            if controller_dropped_task:
+                await self.schedule_ready_tasks()

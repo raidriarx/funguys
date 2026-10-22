@@ -65,6 +65,32 @@ def mcp_worker_command(
     from funguys.mcp_bridge.server import run_mcp_stdio_worker
     run_mcp_stdio_worker(host_url=host_url, token=token, name=name, profile=profile, is_controller=controller)
 
+@app.command('btw')
+def btw_command(
+    message: str = typer.Argument(..., help='Guidance or /btw message to send to the Main Controller'),
+    host_url: str = typer.Option('http://localhost:8420', '--host-url'),
+    token: str = typer.Option('', '--token', envvar='FUNGUYS_WORKER_TOKEN'),
+):
+    """Send a /btw live steering note from any terminal to the Main Controller."""
+    import json, urllib.request
+    if not token:
+        admin_path = Path.cwd() / '.funguys' / 'admin_token'
+        if admin_path.exists():
+            token = admin_path.read_text(encoding='utf-8').strip()
+    text = message.strip()
+    if not text.lower().startswith('/btw'):
+        text = '/btw ' + text
+    payload = json.dumps({'question': text, 'preferred_agent_id': 'auto'}).encode('utf-8')
+    req = urllib.request.Request(
+        host_url.rstrip('/') + '/api/chat/ask',
+        data=payload,
+        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'},
+        method='POST',
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        res = json.loads(resp.read().decode('utf-8'))
+        console.print(f"[bold green]Controller ({res.get('agent_codename', 'C2')})[/bold green]: {res.get('answer', '')}")
+
 @app.command('graph')
 def graph_command(workspace:Path=typer.Argument(Path('.')),query:Optional[str]=typer.Option(None,'--query','-q')):
     engine = GraphifyEngine(workspace.resolve())

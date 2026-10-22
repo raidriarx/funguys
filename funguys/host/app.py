@@ -252,7 +252,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
                     or (
                         identity['role'] == 'worker'
                         and (
-                            path in ('/api/worker/assignment', '/api/workspace/snapshot', '/api/controller/signal', '/api/controller/arbitrate', '/api/blackboard')
+                            path in ('/api/worker/assignment', '/api/workspace/snapshot', '/api/controller/signal', '/api/controller/arbitrate', '/api/blackboard', '/api/chat/ask', '/api/chat/btw/end')
                             or (path.startswith('/api/tasks/') and path.endswith(('/submit', '/execution-failed')))
                             or (path.startswith('/api/agents/') and path.endswith(('/steer', '/handoff')))
                             or path == f"/api/agents/{identity['agent_id']}/heartbeat"
@@ -304,14 +304,15 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
         failures = [t for t in login_failures.get(ip,[]) if now-t < 60]
         if len(failures) >= 5:
             raise HTTPException(429, 'Too many login attempts; retry in one minute')
-        if not secrets.compare_digest(req.token, access.admin_token):
+        identity = access.identify(req.token)
+        if not identity or identity['role'] not in ('admin', 'worker'):
             if len(login_failures) > 1024:
                 login_failures.clear()
             login_failures[ip] = [*failures,now]
             raise HTTPException(401, 'Invalid administrator token')
         login_failures.pop(ip,None)
-        response = JSONResponse({'signed_in':True})
-        response.set_cookie('funguys_session', access.admin_token, httponly=True, samesite='strict', secure=request.url.scheme=='https', max_age=43200)
+        response = JSONResponse({'signed_in':True, 'role':identity['role'], 'agent_id':identity.get('agent_id')})
+        response.set_cookie('funguys_session', req.token, httponly=True, samesite='strict', secure=request.url.scheme=='https', max_age=43200)
         return response
 
     @app.delete('/api/session')
@@ -735,7 +736,7 @@ def _create_host_app(base_dir,*,admin_token,public_url,bind_host,tunnel_url_prov
     async def websocket(ws:WebSocket):
         origin = ws.headers.get('origin')
         identity = access.identify(ws.cookies.get('funguys_session',''))
-        if not identity or identity['role']!='admin' or (origin and urlsplit(origin).netloc!=ws.headers.get('host')):
+        if not identity or identity['role'] not in ('admin', 'worker') or (origin and urlsplit(origin).netloc!=ws.headers.get('host')):
             await ws.close(code=1008)
             return
         await ws.accept()

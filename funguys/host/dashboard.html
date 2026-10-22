@@ -21,7 +21,7 @@
 <body>
 <header><div><h1>FUNGUYS // MISSION CONTROL</h1><p class="muted">Collaborative engineering · Main Controller C2 · token-efficient swarm</p></div><div class="row"><span id="connection" class="warn">CONNECTING</span><button id="restart-host" title="Restart Host Process">Restart Host</button><button id="sign-out" hidden>Sign out</button></div></header>
 <div id="error" class="notice bad" role="alert" hidden></div><div id="busy" role="status" hidden>Working…</div>
-<section id="login"><h2>Administrator sign in</h2><p>Use the token saved in <code>.funguys/admin_token</code> on the host machine. Workers connect through the invitation commands.</p><form id="login-form"><label for="login-token">Administrator token</label><input id="login-token" type="password" required autocomplete="current-password"><p><button class="primary">Sign in</button></p></form></section>
+<section id="login"><h2>Administrator or Teammate sign in</h2><p>Use the host token saved in <code>.funguys/admin_token</code> or your enrolled teammate <code>worker_token</code>. Workers connect through the invitation commands.</p><form id="login-form"><label for="login-token">Administrator or Worker token</label><input id="login-token" type="password" required autocomplete="current-password"><p><button class="primary">Sign in</button></p></form></section>
 <main id="app" hidden>
 <nav id="screen-nav" class="row" style="margin-bottom:16px;gap:8px">
   <button type="button" id="nav-btn-project" class="tab-btn active">⚡ Project & Tasks</button>
@@ -135,7 +135,7 @@
 
   <div class="columns">
     <section>
-      <h2>Project questions & Main Controller Steering</h2>
+      <h2>Swarm Terminal · Project Questions & Main Controller /btw Steering</h2>
       <div id="btw-banner" style="display:none;background:#0d1c14;border:1px solid #4a9;padding:12px;margin-bottom:12px">
         <div class="row" style="justify-content:space-between">
           <div>
@@ -149,10 +149,10 @@
         <label for="chat-agent">Consult agent</label>
         <select id="chat-agent"></select>
         <label for="chat-question">Question or /btw guidance</label>
-        <textarea id="chat-question" placeholder="Ask a question or prefix with /btw to guide active work..." required></textarea>
+        <textarea id="chat-question" placeholder="Ask a question or prefix with /btw to have the Main Controller steer active work..." required></textarea>
         <p><button id="chat-submit-btn">Ask agent</button></p>
       </form>
-      <p class="muted">Answers use supplied project context. Prefix with /btw to provide persistent guidance to a working agent without interrupting their active task.</p>
+      <p class="muted">Answers use supplied project context. Prefix with /btw to send live guidance through the Main Controller to active workers without interrupting their tasks.</p>
       <div id="chat"></div>
     </section>
     <section>
