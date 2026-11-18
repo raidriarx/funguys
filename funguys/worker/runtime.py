@@ -251,6 +251,12 @@ def resolve_cli_binary(provider):
     binary = shutil.which(provider)
     if not binary and provider == 'gemini':
         binary = shutil.which('agy')
+        if not binary and os.name == 'nt':
+            localappdata = os.environ.get('LOCALAPPDATA')
+            if localappdata:
+                agy_exe = Path(localappdata) / 'agy' / 'bin' / 'agy.exe'
+                if agy_exe.is_file():
+                    binary = str(agy_exe)
     if binary:
         return binary
     candidates = [provider, 'agy'] if provider == 'gemini' else [provider]
@@ -263,6 +269,10 @@ def resolve_cli_binary(provider):
         home / '.nvm' / 'current' / 'bin',
         home / 'Library' / 'pnpm',
     ]
+    if os.name == 'nt':
+        localappdata = os.environ.get('LOCALAPPDATA')
+        if localappdata:
+            extra_dirs.append(Path(localappdata) / 'agy' / 'bin')
     nvm_versions = home / '.nvm' / 'versions' / 'node'
     if nvm_versions.is_dir():
         try:
@@ -282,13 +292,43 @@ def cli_command(provider, root, prompt, model=None, effort=None):
     if not binary:
         raise RuntimeError(f'The selected {provider} CLI is not installed on this machine; no provider was substituted')
     prefix = [binary]
-    if Path(binary).suffix.lower() in ('.cmd','.bat'):
-        entries = {'codex':'@openai/codex/bin/codex.js','claude':'@anthropic-ai/claude-code/cli.js','gemini':'@google/gemini-cli/dist/index.js'}
-        entry = Path(binary).parent/'node_modules'/entries.get(provider,'missing')
+    if Path(binary).suffix.lower() in ('.cmd', '.bat'):
         node = shutil.which('node')
-        if not node or not entry.is_file():
+        nm = Path(binary).parent / 'node_modules'
+        prefix = None
+        if provider == 'codex':
+            entry = nm / '@openai' / 'codex' / 'bin' / 'codex.js'
+            if node and entry.is_file():
+                prefix = [node, str(entry)]
+        elif provider == 'claude':
+            for js_rel in ['@anthropic-ai/claude-code/cli.js']:
+                entry = nm / Path(js_rel)
+                if node and entry.is_file():
+                    prefix = [node, str(entry)]
+                    break
+            if not prefix:
+                native_claude = nm / '@anthropic-ai' / 'claude-code' / 'bin' / 'claude.exe'
+                local_claude = Path.home() / '.local' / 'bin' / 'claude.exe'
+                if native_claude.is_file():
+                    prefix = [str(native_claude)]
+                elif local_claude.is_file():
+                    prefix = [str(local_claude)]
+        elif provider == 'gemini':
+            agy_which = shutil.which('agy')
+            local_agy = (Path(os.environ.get('LOCALAPPDATA', '')) / 'agy' / 'bin' / 'agy.exe') if os.environ.get('LOCALAPPDATA') else None
+            if agy_which:
+                prefix = [agy_which]
+            elif local_agy and local_agy.is_file():
+                prefix = [str(local_agy)]
+            else:
+                for js_rel in ['@google/gemini-cli/dist/index.js', '@google/gemini-cli/bundle/gemini.js']:
+                    entry = nm / Path(js_rel)
+                    if node and entry.is_file():
+                        prefix = [node, str(entry)]
+                        break
+
+        if not prefix:
             raise RuntimeError('A native CLI or a discoverable Node entry point is required; batch wrappers are not executed with task text')
-        prefix = [node,str(entry)]
     if provider == 'codex':
         cmd = [*prefix, 'exec', '-C', str(root), '--skip-git-repo-check', '--sandbox', 'workspace-write', '-c', 'approval_policy="never"']
         if model:
@@ -305,7 +345,8 @@ def cli_command(provider, root, prompt, model=None, effort=None):
         return cmd
     if provider == 'gemini':
         model_tag = f"{model}-{effort}" if (model and effort) else (model or '')
-        if Path(binary).stem.lower() == 'agy':
+        is_agy = (Path(prefix[0]).stem.lower() == 'agy') or (Path(binary).stem.lower() == 'agy')
+        if is_agy:
             cmd = [*prefix, '-p', prompt]
             if model_tag:
                 cmd.extend(['--model', model_tag])
